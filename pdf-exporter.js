@@ -13,6 +13,8 @@ class PDFExporter {
     this.margin = 40;
     this.fontSizes = { h1:24, h2:18, normal:12 };
     this.leading = this.fontSizes.normal * 1.2;
+    // Default cell padding
+    this.tableCellPadding = 5;
     // Built-in fonts
     this.fH = this._addObject('<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica-Bold >>');
     this.fB = this._addObject('<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica-Bold >>');
@@ -245,49 +247,56 @@ class PDFExporter {
     });
   }
 
-  // Gather table cell texts into a structured object
+  // Gather table cell elements into a structured object
   _prepareTable(tableEl) {
     const headers = [];
     const rows = [];
     const thead = tableEl.querySelector('thead');
     if (thead) {
       Array.from(thead.querySelectorAll('tr')).forEach(tr => {
-        const cells = Array.from(tr.querySelectorAll('th')).map(th => th.textContent.trim());
-        headers.push(cells);
+        headers.push(Array.from(tr.querySelectorAll('th')));
       });
     }
-    // All rows outside thead
-    Array.from(tableEl.querySelectorAll('tr')).forEach(tr => {
-      if (!thead || !thead.contains(tr)) {
-        const cells = Array.from(tr.querySelectorAll('td')).map(td => td.textContent.trim());
+    // prefer tbody if present
+    const tbody = tableEl.querySelector('tbody');
+    if (tbody) {
+      Array.from(tbody.querySelectorAll('tr')).forEach(tr => {
+        const cells = Array.from(tr.querySelectorAll('td'));
         if (cells.length) rows.push(cells);
-      }
-    });
+      });
+    } else {
+      Array.from(tableEl.querySelectorAll('tr')).forEach(tr => {
+        if (!thead || !thead.contains(tr)) {
+          const cells = Array.from(tr.querySelectorAll('td'));
+          if (cells.length) rows.push(cells);
+        }
+      });
+    }
     const colCount = headers[0] ? headers[0].length : (rows[0] ? rows[0].length : 0);
-    return { headers, rows, colCount, columnWidths: [] };
+    return { tableEl, headers, rows, colCount, columnWidths: [] };
   }
 
   // Measure each column's max width based on cell content
   _measureTable(tableData, styleState) {
     const { headers, rows, colCount } = tableData;
     const colWidths = new Array(colCount).fill(0);
+    const pad = this.tableCellPadding || 5;
     // measure headers
-    headers.forEach(row => {
-      row.forEach((text, idx) => {
-        const w = this._textWidth(text, styleState.size);
+    headers.forEach(rowEls => {
+      rowEls.forEach((cellEl, idx) => {
+        const text = cellEl.textContent.trim();
+        const w = this._textWidth(text, styleState.size) + pad * 2;
         if (w > colWidths[idx]) colWidths[idx] = w;
       });
     });
     // measure body rows
-    rows.forEach(row => {
-      row.forEach((text, idx) => {
-        const w = this._textWidth(text, styleState.size);
+    rows.forEach(rowEls => {
+      rowEls.forEach((cellEl, idx) => {
+        const text = cellEl.textContent.trim();
+        const w = this._textWidth(text, styleState.size) + pad * 2;
         if (w > colWidths[idx]) colWidths[idx] = w;
       });
     });
-    // add padding
-    const pad = this.tableCellPadding || 5;
-    for (let i = 0; i < colCount; i++) colWidths[i] += pad * 2;
     tableData.columnWidths = colWidths;
   }
 
@@ -308,11 +317,103 @@ class PDFExporter {
     }
   }
 
+  // Draw text at arbitrary position (for table cells)
+  _drawCell(text, styleState, x, y) {
+    const safe = text.replace(/\(/g, '\\(').replace(/\)/g, '\\)').replace(/\\/g, '\\\\');
+    this._write(
+      'BT /' + styleState.fontKey + ' ' + styleState.size + ' Tf ' +
+      x + ' ' + y + ' Td (' + safe + ') Tj ET\n'
+    );
+  }
+
+  // Render table with cell backgrounds, borders, and text (honors CSS background and text-align)
+  _renderTable(tableData, styleState) {
+    const pad = this.tableCellPadding;
+    const fontSize = styleState.size;
+    const lineHeight = fontSize * 1.2;
+    const cellHeight = lineHeight + pad * 2;
+    const x0 = this.margin;
+    const headers = tableData.headers;
+    const rows = tableData.rows;
+    const colWidths = tableData.columnWidths;
+    const colCount = colWidths.length;
+    const rowCount = headers.length + rows.length;
+    const tableWidth = colWidths.reduce((a, b) => a + b, 0);
+    const tableHeight = cellHeight * rowCount;
+
+    // Page break if needed
+    if (this.cursorY - tableHeight < this.margin) {
+      this._newPage();
+    }
+    const yTop = this.cursorY;
+
+    // Precompute x positions
+    const xPos = [x0];
+    colWidths.reduce((acc, w) => { const next = acc + w; xPos.push(next); return next; }, x0);
+
+    // Fill cell backgrounds
+    let rowIndex = 0;
+    const fillBg = (cellEl, ci) => {
+      const style = window.getComputedStyle(cellEl);
+      const bg = style.backgroundColor;
+      if (bg && bg !== 'transparent' && !/^rgba\(0, 0, 0, 0\)$/.test(bg)) {
+        const c = PDFExporter._parseCssColor(bg);
+        const x = xPos[ci];
+        const y = yTop - (rowIndex + 1) * cellHeight;
+        this._write(c.r.toFixed(3) + ' ' + c.g.toFixed(3) + ' ' + c.b.toFixed(3) + ' rg\n');
+        this._write(x + ' ' + y + ' ' + colWidths[ci] + ' ' + cellHeight + ' re f\n');
+        this._write('0 0 0 rg\n');
+      }
+    };
+    headers.forEach(rowEls => {
+      rowEls.forEach((cellEl, ci) => fillBg(cellEl, ci));
+      rowIndex++;
+    });
+    rows.forEach(rowEls => {
+      rowEls.forEach((cellEl, ci) => fillBg(cellEl, ci));
+      rowIndex++;
+    });
+
+    // Draw grid lines
+    for (let i = 0; i <= rowCount; i++) {
+      const y = yTop - i * cellHeight;
+      this._write(x0 + ' ' + y + ' m ' + (x0 + tableWidth) + ' ' + y + ' l S\n');
+    }
+    for (let xi = 0; xi < xPos.length; xi++) {
+      const x = xPos[xi];
+      this._write(x + ' ' + yTop + ' m ' + x + ' ' + (yTop - tableHeight) + ' l S\n');
+    }
+
+    // Draw text with alignment
+    rowIndex = 0;
+    const drawRowText = (rowEls, isHeader) => {
+      rowEls.forEach((cellEl, ci) => {
+        const text = cellEl.textContent.trim();
+        const style = window.getComputedStyle(cellEl);
+        const align = style.textAlign;
+        const w = this._textWidth(text, fontSize);
+        let xText = xPos[ci] + pad;
+        if (align === 'center') xText = xPos[ci] + (colWidths[ci] - w) / 2;
+        else if (align === 'right') xText = xPos[ci] + colWidths[ci] - pad - w;
+        const y = yTop - rowIndex * cellHeight - pad - fontSize;
+        this._drawCell(text, { fontKey: isHeader ? 'B' : 'N', size: fontSize }, xText, y);
+      });
+      rowIndex++;
+    };
+    headers.forEach(rowEls => drawRowText(rowEls, true));
+    rows.forEach(rowEls => drawRowText(rowEls, false));
+
+    // Advance cursor below table
+    this.cursorY = yTop - tableHeight - this.leading * 0.2;
+  }
+
   static init(opts) {
     const pdf = new PDFExporter();
     // List configuration
     pdf.bulletIndent = opts.bulletIndent || 20;
     pdf.hangingIndent = opts.hangingIndent || pdf.bulletIndent;
+    // Table configuration
+    pdf.tableCellPadding = opts.tableCellPadding || pdf.tableCellPadding;
     pdf._newPage();
     const els = document.querySelectorAll(opts.selector);
     els.forEach(function(el) {
@@ -351,7 +452,8 @@ class PDFExporter {
           pdf.tables.push(tableData);
           pdf._measureTable(tableData, styleState);
           pdf._layoutTable(tableData);
-          // TODO: render table using tableData.columnWidths
+          // Render the table
+          pdf._renderTable(tableData, styleState);
         }
         pdf.cursorY -= pdf.leading * 0.2;
       });
