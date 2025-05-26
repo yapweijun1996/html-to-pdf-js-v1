@@ -79,15 +79,70 @@ class PDFExporter {
     }
     m = cssColor.match(/^#([0-9a-fA-F]{6})$/);
     if (m) {
-      var hex = parseInt(m[1], 16);
+      var hex6 = m[1];
       return {
-        r: ((hex>>16)&0xFF)/255,
-        g: ((hex>>8)&0xFF)/255,
-        b: (hex&0xFF)/255,
+        r: ((hex6>>16)&0xFF)/255,
+        g: ((hex6>>8)&0xFF)/255,
+        b: (hex6&0xFF)/255,
         a: 1
       };
     }
+    // 3-digit hex, e.g. #abc
+    m = cssColor.match(/^#([0-9a-fA-F]{3})$/);
+    if (m) {
+      const h = m[1];
+      return {
+        r: parseInt(h[0] + h[0], 16)/255,
+        g: parseInt(h[1] + h[1], 16)/255,
+        b: parseInt(h[2] + h[2], 16)/255,
+        a: 1
+      };
+    }
+    // hsl and hsla
+    m = cssColor.match(/^hsla?\(\s*(\d+(?:\.\d+)?)\s*,\s*(\d+(?:\.\d+)?)%\s*,\s*(\d+(?:\.\d+)?)%\s*(?:,\s*([01]?\.\d+)\s*)?\)$/);
+    if (m) {
+      const h = parseFloat(m[1]) % 360;
+      const s = parseFloat(m[2]) / 100;
+      const l = parseFloat(m[3]) / 100;
+      const a = m[4] !== undefined ? parseFloat(m[4]) : 1;
+      let r, g, b;
+      if (s === 0) {
+        r = g = b = l;
+      } else {
+        const hue2rgb = (p, q, t) => {
+          if (t < 0) t += 1;
+          if (t > 1) t -= 1;
+          if (t < 1/6) return p + (q - p) * 6 * t;
+          if (t < 1/2) return q;
+          if (t < 2/3) return p + (q - p) * (2/3 - t) * 6;
+          return p;
+        };
+        const q = l < 0.5 ? l * (1 + s) : l + s - l * s;
+        const p = 2 * l - q;
+        const hk = h / 360;
+        r = hue2rgb(p, q, hk + 1/3);
+        g = hue2rgb(p, q, hk);
+        b = hue2rgb(p, q, hk - 1/3);
+      }
+      return { r, g, b, a };
+    }
     return { r: 0, g: 0, b: 0, a: 0 };
+  }
+
+  // Parse CSS length strings (px, pt, em) into numeric px; defaults 0.
+  static _parseCssLength(cssValue, baseFontSize = 0) {
+    if (!cssValue || cssValue === 'auto') return 0;
+    const m = cssValue.match(/^([\d.]+)(px|pt|em)?$/);
+    if (m) {
+      const v = parseFloat(m[1]);
+      const unit = m[2] || 'px';
+      switch (unit) {
+        case 'px': return v;
+        case 'pt': return v * (96/72); // convert pt to px
+        case 'em': return v * baseFontSize;
+      }
+    }
+    return parseFloat(cssValue) || 0;
   }
 
   // Low-level draw a single text run at x,y
@@ -133,9 +188,9 @@ class PDFExporter {
       if (tag === 'EM' || tag === 'I') newStyle.fontKey = 'I';
       const cs = window.getComputedStyle(node);
       if (cs.color) newStyle.color = PDFExporter._parseCssColor(cs.color);
-      if (cs.fontSize.endsWith('px')) newStyle.size = parseFloat(cs.fontSize);
-      this._processInline(node.firstChild, newStyle);
-      Array.from(node.childNodes).slice(1).forEach(child => this._processInline(child, newStyle));
+      newStyle.size = PDFExporter._parseCssLength(cs.fontSize, styleState.size);
+      // Recursively process all child nodes with inherited styles
+      Array.from(node.childNodes).forEach(child => this._processInline(child, newStyle));
     }
   }
 
@@ -189,69 +244,117 @@ class PDFExporter {
     }
   }
 
-  // Render table rows across pages
+  // Render table rows across pages with multi-line cell support
   _renderTable(tableData, styleState) {
     const pad = this.tableCellPadding;
     const fontSize = styleState.size;
-    const cellH = fontSize*1.2 + pad*2;
+    const lineHeight = fontSize * 1.2;
     const x0 = this.margin;
     const widths = tableData.columnWidths;
-    const totalW = widths.reduce((a,b)=>a+b,0);
-    let rowCursor = 0;
-    const allRows = [...tableData.headers.map(r=>({cells:r, header:true})), ...tableData.rows.map(r=>({cells:r, header:false}))];
-    const drawGrid = yTop => {
-      for (let i=0;i<=allRows.length && i<=rowCursor+1;i++) {
-        const y = yTop - i*cellH;
-        this._write(`${x0} ${y} m ${x0+totalW} ${y} l S\n`);
-      }
-      let acc = x0;
-      widths.forEach(w=>{
-        this._write(`${acc} ${yTop} m ${acc} ${yTop - cellH*(rowCursor+1)} l S\n`);
-        acc+=w;
+    const totalW = widths.reduce((a, b) => a + b, 0);
+
+    // Combine headers and rows
+    const allRows = [
+      ...tableData.headers.map(r => ({ cells: r, header: true })),
+      ...tableData.rows.map(r => ({ cells: r, header: false }))
+    ];
+
+    // Helper to wrap text within a cell
+    const wrapText = (text, maxW) => {
+      const words = text.split(' ');
+      const lines = [];
+      let current = '';
+      words.forEach(word => {
+        const test = current ? current + ' ' + word : word;
+        if (this._textWidth(test, fontSize) > maxW - pad * 2 && current) {
+          lines.push(current);
+          current = word;
+        } else {
+          current = test;
+        }
       });
-      this._write(`${x0+totalW} ${yTop} m ${x0+totalW} ${yTop - cellH*(rowCursor+1)} l S\n`);
+      if (current) lines.push(current);
+      return lines;
     };
 
-    let pageStart = true;
+    // Precompute wrapped lines and row heights
+    const cellLines = allRows.map(({ cells }) =>
+      cells.map((cell, ci) => wrapText(cell.textContent.trim(), widths[ci]))
+    );
+    const rowHeights = cellLines.map(linesArr => {
+      const maxLines = Math.max(...linesArr.map(lines => lines.length));
+      return maxLines * lineHeight + pad * 2;
+    });
+
+    let rowCursor = 0;
     while (rowCursor < allRows.length) {
-      if (pageStart) {
-        const yTop = this.cursorY;
-        drawGrid(yTop);
-        pageStart = false;
+      const yTop = this.cursorY;
+      // Determine rows that fit on this page
+      let sumH = 0;
+      let end = rowCursor;
+      while (end < allRows.length && sumH + rowHeights[end] <= yTop - this.margin) {
+        sumH += rowHeights[end];
+        end++;
       }
-      const {cells, header} = allRows[rowCursor];
-      const yText = this.cursorY - pad - fontSize;
+
+      // Draw grid lines
+      this._write(`${x0} ${yTop} m ${x0 + totalW} ${yTop} l S\n`);
+      let accH = 0;
+      for (let i = rowCursor; i < end; i++) {
+        accH += rowHeights[i];
+        const yLine = yTop - accH;
+        this._write(`${x0} ${yLine} m ${x0 + totalW} ${yLine} l S\n`);
+      }
+      // Vertical lines
       let accX = x0;
-      cells.forEach((cellEl,i)=>{
-        const text = cellEl.textContent.trim();
-        const cs = window.getComputedStyle(cellEl);
-        let align = cs.textAlign;
-        const w = this._textWidth(text, fontSize);
-        let x = accX + pad;
-        if (align==='center') x = accX + (widths[i]-w)/2;
-        else if (align==='right') x = accX + widths[i]-pad-w;
-        this._drawCell(text, header? 'B':'N', fontSize, x, yText, null);
-        accX += widths[i];
+      widths.forEach(w => {
+        this._write(`${accX} ${yTop} m ${accX} ${yTop - sumH} l S\n`);
+        accX += w;
       });
-      this.cursorY -= cellH;
-      rowCursor++;
-      if (rowCursor < allRows.length && this.cursorY - cellH < this.margin) {
-        this._newPage();
-        pageStart = true;
+      this._write(`${x0 + totalW} ${yTop} m ${x0 + totalW} ${yTop - sumH} l S\n`);
+
+      // Render each row
+      for (; rowCursor < end; rowCursor++) {
+        const { cells, header } = allRows[rowCursor];
+        const linesArr = cellLines[rowCursor];
+        const height = rowHeights[rowCursor];
+        const yTextStart = this.cursorY - pad - fontSize;
+        accX = x0;
+
+        cells.forEach((cellEl, ci) => {
+          const align = window.getComputedStyle(cellEl).textAlign;
+          const lines = linesArr[ci];
+          const colW = widths[ci];
+          lines.forEach((ln, li) => {
+            const tw = this._textWidth(ln, fontSize);
+            let x = accX + pad;
+            if (align === 'center') x = accX + (colW - tw) / 2;
+            else if (align === 'right') x = accX + colW - pad - tw;
+            const y = yTextStart - li * lineHeight;
+            this._drawCell(ln, header ? 'B' : 'N', fontSize, x, y, null);
+          });
+          accX += colW;
+        });
+
+        this.cursorY -= height;
+        if (rowCursor + 1 < allRows.length && this.cursorY - rowHeights[rowCursor + 1] < this.margin) {
+          this._newPage();
+          break;
+        }
       }
     }
-    this.cursorY -= this.leading*0.2;
+    this.cursorY -= lineHeight * 0.2;
   }
 
   // Process any block-level element: margins, padding, background, border, then children
   _processBlock(el, styleState) {
     const cs = window.getComputedStyle(el);
-    const mt = parseFloat(cs.marginTop) || 0;
+    const mt = PDFExporter._parseCssLength(cs.marginTop, styleState.size);
     this.cursorY -= mt;
     // Background fill
     const bg = cs.backgroundColor;
     const c = PDFExporter._parseCssColor(bg);
-    const height = parseFloat(cs.height) || 0;
+    const height = PDFExporter._parseCssLength(cs.height, styleState.size);
     if (c.a > 0 && height > 0) {
       const x = this.margin;
       const width = this.pageWidth - 2 * this.margin;
@@ -260,18 +363,18 @@ class PDFExporter {
       this._write(`${x} ${y} ${width} ${height} re f\n`);
       this._write('0 0 0 rg\n');
     }
-    const bw = parseFloat(cs.borderWidth) || 0;
+    const bw = PDFExporter._parseCssLength(cs.borderWidth, styleState.size);
     if (bw > 0) {
       const bc = PDFExporter._parseCssColor(cs.borderColor);
       this._write(`${bc.r.toFixed(3)} ${bc.g.toFixed(3)} ${bc.b.toFixed(3)} RG\n`);
       const x = this.margin;
-      const y = this.cursorY - (parseFloat(cs.height) || 0);
+      const y = this.cursorY - height;
       const w = this.pageWidth - 2 * this.margin;
-      const h = parseFloat(cs.height) || 0;
+      const h = height;
       this._write(`${x} ${y} ${w} ${h} re S\n`);
       this._write('0 0 0 RG\n');
     }
-    const pt = parseFloat(cs.paddingTop) || 0;
+    const pt = PDFExporter._parseCssLength(cs.paddingTop, styleState.size);
     this.cursorY -= pt;
     Array.from(el.childNodes).forEach(child => {
       if (child.nodeType === 3) this._processInline(child, styleState);
@@ -295,9 +398,9 @@ class PDFExporter {
         }
       }
     });
-    const pb = parseFloat(cs.paddingBottom) || 0;
+    const pb = PDFExporter._parseCssLength(cs.paddingBottom, styleState.size);
     this.cursorY -= pb;
-    const mb = parseFloat(cs.marginBottom) || 0;
+    const mb = PDFExporter._parseCssLength(cs.marginBottom, styleState.size);
     this.cursorY -= mb;
   }
 
