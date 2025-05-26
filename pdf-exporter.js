@@ -67,16 +67,27 @@ class PDFExporter {
   }
 
   static _parseCssColor(cssColor) {
-    var m = cssColor.match(/rgba?\((\d+),\s*(\d+),\s*(\d+)/);
+    // Parse rgb/rgba with optional alpha, and #rrggbb
+    var m = cssColor.match(/rgba?\((\d+),\s*(\d+),\s*(\d+)(?:,\s*([01]?\.?\d*))?\)/);
     if (m) {
-      return { r: parseInt(m[1], 10)/255, g: parseInt(m[2], 10)/255, b: parseInt(m[3], 10)/255 };
+      return {
+        r: parseInt(m[1], 10)/255,
+        g: parseInt(m[2], 10)/255,
+        b: parseInt(m[3], 10)/255,
+        a: m[4] !== undefined ? parseFloat(m[4]) : 1
+      };
     }
     m = cssColor.match(/^#([0-9a-fA-F]{6})$/);
     if (m) {
       var hex = parseInt(m[1], 16);
-      return { r: ((hex>>16)&0xFF)/255, g: ((hex>>8)&0xFF)/255, b: (hex&0xFF)/255 };
+      return {
+        r: ((hex>>16)&0xFF)/255,
+        g: ((hex>>8)&0xFF)/255,
+        b: (hex&0xFF)/255,
+        a: 1
+      };
     }
-    return { r: 0, g: 0, b: 0 };
+    return { r: 0, g: 0, b: 0, a: 0 };
   }
 
   // Low-level draw a single text run at x,y
@@ -237,17 +248,6 @@ class PDFExporter {
     const cs = window.getComputedStyle(el);
     const mt = parseFloat(cs.marginTop) || 0;
     this.cursorY -= mt;
-    const bg = cs.backgroundColor;
-    if (bg && bg!=='transparent') {
-      const c = PDFExporter._parseCssColor(bg);
-      const x = this.margin;
-      const width = this.pageWidth - 2*this.margin;
-      const height = parseFloat(cs.height) || 0;
-      const y = this.cursorY - height;
-      this._write(`${c.r.toFixed(3)} ${c.g.toFixed(3)} ${c.b.toFixed(3)} rg\n`);
-      this._write(`${x} ${y} ${width} ${height} re f\n`);
-      this._write('0 0 0 rg\n');
-    }
     const bw = parseFloat(cs.borderWidth) || 0;
     if (bw>0) {
       const bc = PDFExporter._parseCssColor(cs.borderColor);
@@ -287,6 +287,19 @@ class PDFExporter {
     this.cursorY -= pb;
     const mb = parseFloat(cs.marginBottom) || 0;
     this.cursorY -= mb;
+
+    // Draw background if non-transparent and height available
+    const bg = cs.backgroundColor;
+    const c = PDFExporter._parseCssColor(bg);
+    const height = parseFloat(cs.height) || 0;
+    if (c.a > 0 && height > 0) {
+      const x = this.margin;
+      const width = this.pageWidth - 2*this.margin;
+      const y = this.cursorY - height;
+      this._write(`${c.r.toFixed(3)} ${c.g.toFixed(3)} ${c.b.toFixed(3)} rg\n`);
+      this._write(`${x} ${y} ${width} ${height} re f\n`);
+      this._write('0 0 0 rg\n');
+    }
   }
 
   save(filename) {
