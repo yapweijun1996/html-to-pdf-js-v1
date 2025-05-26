@@ -248,13 +248,25 @@ class PDFExporter {
     const cs = window.getComputedStyle(el);
     const mt = parseFloat(cs.marginTop) || 0;
     this.cursorY -= mt;
+    // Background fill
+    const bg = cs.backgroundColor;
+    const c = PDFExporter._parseCssColor(bg);
+    const height = parseFloat(cs.height) || 0;
+    if (c.a > 0 && height > 0) {
+      const x = this.margin;
+      const width = this.pageWidth - 2 * this.margin;
+      const y = this.cursorY - height;
+      this._write(`${c.r.toFixed(3)} ${c.g.toFixed(3)} ${c.b.toFixed(3)} rg\n`);
+      this._write(`${x} ${y} ${width} ${height} re f\n`);
+      this._write('0 0 0 rg\n');
+    }
     const bw = parseFloat(cs.borderWidth) || 0;
-    if (bw>0) {
+    if (bw > 0) {
       const bc = PDFExporter._parseCssColor(cs.borderColor);
       this._write(`${bc.r.toFixed(3)} ${bc.g.toFixed(3)} ${bc.b.toFixed(3)} RG\n`);
       const x = this.margin;
-      const y = this.cursorY - (parseFloat(cs.height)||0);
-      const w = this.pageWidth - 2*this.margin;
+      const y = this.cursorY - (parseFloat(cs.height) || 0);
+      const w = this.pageWidth - 2 * this.margin;
       const h = parseFloat(cs.height) || 0;
       this._write(`${x} ${y} ${w} ${h} re S\n`);
       this._write('0 0 0 RG\n');
@@ -263,7 +275,7 @@ class PDFExporter {
     this.cursorY -= pt;
     Array.from(el.childNodes).forEach(child => {
       if (child.nodeType === 3) this._processInline(child, styleState);
-      else if (child.nodeType===1) {
+      else if (child.nodeType === 1) {
         const tag = child.tagName;
         if (tag==='H1') {
           this._drawStyledText(child.textContent.trim(), { fontKey:'H', size:this.fontSizes.h1, color:styleState.color, indent:styleState.indent });
@@ -287,19 +299,6 @@ class PDFExporter {
     this.cursorY -= pb;
     const mb = parseFloat(cs.marginBottom) || 0;
     this.cursorY -= mb;
-
-    // Draw background if non-transparent and height available
-    const bg = cs.backgroundColor;
-    const c = PDFExporter._parseCssColor(bg);
-    const height = parseFloat(cs.height) || 0;
-    if (c.a > 0 && height > 0) {
-      const x = this.margin;
-      const width = this.pageWidth - 2*this.margin;
-      const y = this.cursorY - height;
-      this._write(`${c.r.toFixed(3)} ${c.g.toFixed(3)} ${c.b.toFixed(3)} rg\n`);
-      this._write(`${x} ${y} ${width} ${height} re f\n`);
-      this._write('0 0 0 rg\n');
-    }
   }
 
   save(filename) {
