@@ -746,8 +746,8 @@ class PDFExporter {
   // Recursively process inline <strong>,<em>,<span style> etc.
   _processInline(node, styleState) {
     if (node.nodeType === Node.TEXT_NODE) {
-      const txt = node.textContent.trim(); // Trim to avoid drawing empty spaces that might still add annotations
-      if (txt) this._drawStyledText(txt, styleState);
+      const txt = this._normalizeWhiteSpace(node.textContent);
+      if (txt.length) this._drawStyledText(txt, styleState);
     } else if (node.nodeType === Node.ELEMENT_NODE) {
       const cs = this._getStyle(node);
       if (cs.display === 'none') {
@@ -848,18 +848,8 @@ class PDFExporter {
                   bulletText = this._getOrdinal(idx, listStyleType);
               }
           } else { // Unordered list
-              switch (listStyleType) {
-                  case 'circle':
-                      bulletText = '◦ '; // ◦
-                      break;
-                  case 'square':
-                      bulletText = '▪ '; // ▪ (or use ■ ■ for filled square)
-                      break;
-                  case 'disc': // Explicitly handle disc
-                  default: // For any other listStyleType not explicitly circle or square, default to disc
-                      bulletText = '• '; // •
-                      break;
-              }
+              // Use custom bullet symbols per list level
+              bulletText = this.ulBulletSymbols[level % this.ulBulletSymbols.length];
           }
         }
 
@@ -900,7 +890,7 @@ class PDFExporter {
           if (childNode.nodeType === Node.ELEMENT_NODE && (childNode.tagName === 'UL' || childNode.tagName === 'OL')) {
             return;
           }
-          if (childNode.nodeType === Node.TEXT_NODE && childNode.textContent.trim() === '') {
+          if (childNode.nodeType === Node.TEXT_NODE && this._normalizeWhiteSpace(childNode.textContent).length === 0) {
             return;
           }
           
@@ -1833,6 +1823,12 @@ class PDFExporter {
       this._handleError('Text normalization failed', error);
       return text; // Return original text if normalization fails
     }
+  }
+
+  // Normalize and collapse whitespace sequences into single spaces
+  _normalizeWhiteSpace(text) {
+    if (!text) return '';
+    return text.replace(/\s+/g, ' ');
   }
 
   // Enhanced text overflow handling
