@@ -1111,7 +1111,9 @@ class PDFExporter {
             }
             
             const y = yTextStart - li * lineHeight;
-            this._drawCell(ln, header ? 'B' : 'N', fontSize, x, y, null);
+            // Use bold font if font-weight is bold, otherwise use fontKey from styleState or default to normal
+            const cellFontKey = (cs.fontWeight === 'bold' || parseInt(cs.fontWeight) >= 700) ? 'B' : styleState.fontKey || 'N';
+            this._drawCell(ln, cellFontKey, fontSize, x, y, null);
           });
           accX += colW;
         });
