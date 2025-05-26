@@ -60,10 +60,10 @@ class PDFExporter {
 
       // Built-in fonts with error handling
       try {
-        this.fH = this._addObject('<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica-Bold >>');
-        this.fB = this._addObject('<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica-Bold >>');
-        this.fI = this._addObject('<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica-Oblique >>');
-        this.fN = this._addObject('<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>');
+        this.fH = this._addObject('<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica-Bold >>'); // Header font
+        this.fB = this._addObject('<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica-Bold >>'); // Bold font
+        this.fI = this._addObject('<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica-Oblique >>'); // Italic font
+        this.fN = this._addObject('<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>'); // Normal font
         this.fM = this._addObject('<< /Type /Font /Subtype /Type1 /BaseFont /Courier >>'); // Monospace font
       } catch (error) {
         this._handleError('Font initialization failed', error);
@@ -73,14 +73,20 @@ class PDFExporter {
       // Canvas for text measurement with fallback
       this.ctx = null;
       this._lastFontSpec = null;
-      try { 
-        const c = document.createElement('canvas'); 
-        this.ctx = c.getContext('2d');
-        if (!this.ctx) {
-          this._addWarning('Canvas context not available, using fallback text measurement');
+      this.isNodeEnvironment = typeof window === 'undefined' || typeof document === 'undefined';
+      
+      if (!this.isNodeEnvironment) {
+        try { 
+          const c = document.createElement('canvas'); 
+          this.ctx = c.getContext('2d');
+          if (!this.ctx) {
+            this._addWarning('Canvas context not available, using fallback text measurement');
+          }
+        } catch(e) { 
+          this._addWarning('Canvas not available, using fallback text measurement');
         }
-      } catch(e) { 
-        this._addWarning('Canvas not available, using fallback text measurement');
+      } else {
+        this._addWarning('Running in Node.js environment, using fallback text measurement');
       }
       
       this.fontFamily = this._validateString(opts.fontFamily, 'Helvetica', 'fontFamily');
@@ -116,22 +122,57 @@ class PDFExporter {
       throw new Error('Options must be an object');
     }
     
-    // Validate page dimensions
-    if (opts.pageWidth && (typeof opts.pageWidth !== 'number' || opts.pageWidth <= 0)) {
-      throw new Error('pageWidth must be a positive number');
+    // Validate page dimensions with type conversion
+    if (opts.pageWidth !== undefined) {
+      const converted = this._validateNumber(opts.pageWidth, null, 'pageWidth');
+      if (converted === null || converted <= 0) {
+        throw new Error('pageWidth must be a positive number');
+      }
+      opts.pageWidth = converted;
     }
-    if (opts.pageHeight && (typeof opts.pageHeight !== 'number' || opts.pageHeight <= 0)) {
-      throw new Error('pageHeight must be a positive number');
+    if (opts.pageHeight !== undefined) {
+      const converted = this._validateNumber(opts.pageHeight, null, 'pageHeight');
+      if (converted === null || converted <= 0) {
+        throw new Error('pageHeight must be a positive number');
+      }
+      opts.pageHeight = converted;
     }
     
-    // Validate margins
-    if (opts.margin && (typeof opts.margin !== 'number' || opts.margin < 0)) {
-      throw new Error('margin must be a non-negative number');
+    // Validate margins with type conversion
+    if (opts.margin !== undefined) {
+      const converted = this._validateNumber(opts.margin, null, 'margin');
+      if (converted === null || converted < 0) {
+        throw new Error('margin must be a non-negative number');
+      }
+      opts.margin = converted;
     }
+    
+    // Validate font sizes
+    const fontSizeFields = ['fontSize', 'h1FontSize', 'h2FontSize', 'h3FontSize', 'h4FontSize', 'h5FontSize', 'h6FontSize'];
+    fontSizeFields.forEach(field => {
+      if (opts[field] !== undefined) {
+        const converted = this._validateNumber(opts[field], null, field);
+        if (converted === null || converted <= 0) {
+          this._addWarning(`${field} must be a positive number, using default`);
+          delete opts[field]; // Let the constructor use defaults
+        } else {
+          opts[field] = converted;
+        }
+      }
+    });
   }
 
   _validateNumber(value, defaultValue, fieldName) {
     if (value === undefined || value === null) return defaultValue;
+    
+    // Attempt type conversion for strings that represent numbers
+    if (typeof value === 'string') {
+      const parsed = parseFloat(value);
+      if (!isNaN(parsed) && isFinite(parsed)) {
+        value = parsed;
+      }
+    }
+    
     if (typeof value !== 'number' || isNaN(value) || value < 0) {
       this._addWarning(`Invalid ${fieldName}: ${value}, using default: ${defaultValue}`);
       return defaultValue;
@@ -214,6 +255,33 @@ class PDFExporter {
     return this.objects.length;
   }
 
+  // Helper method for safer PDF object construction
+  _buildPDFObject(type, properties = {}) {
+    try {
+      let obj = `<< /Type /${type}`;
+      
+      for (const [key, value] of Object.entries(properties)) {
+        if (value !== undefined && value !== null) {
+          if (typeof value === 'string') {
+            obj += ` /${key} (${this._escapePDFString(value)})`;
+          } else if (typeof value === 'number') {
+            obj += ` /${key} ${value}`;
+          } else if (Array.isArray(value)) {
+            obj += ` /${key} [${value.join(' ')}]`;
+          } else {
+            obj += ` /${key} ${value}`;
+          }
+        }
+      }
+      
+      obj += ' >>';
+      return obj;
+    } catch (error) {
+      this._handleError('PDF object construction failed', error);
+      return `<< /Type /${type} >>`; // Minimal fallback
+    }
+  }
+
   _newPage() {
     try {
       const cid = this._addObject('');
@@ -282,6 +350,14 @@ class PDFExporter {
     }
   }
 
+  /**
+   * Fallback text width calculation when canvas is not available
+   * Uses character-specific width approximations for better accuracy than simple multiplication
+   * Handles ASCII, CJK, and Arabic character ranges with different width factors
+   * @param {string} text - Text to measure
+   * @param {number} size - Font size in points
+   * @returns {number} Estimated text width in points
+   */
   _fallbackTextWidth(text, size) {
     // More accurate fallback based on character analysis
     let width = 0;
@@ -306,7 +382,12 @@ class PDFExporter {
     return width;
   }
 
-  // Enhanced CSS color parsing with more formats and better error handling
+  /**
+   * Enhanced CSS color parsing with comprehensive format support and error handling
+   * Supports: hex (#rgb, #rrggbb), rgb/rgba, hsl/hsla, named colors, percentages
+   * @param {string} cssColor - CSS color value to parse
+   * @returns {Object} Color object with r, g, b, a properties (0-1 range)
+   */
   static _parseCssColor(cssColor) {
     if (!cssColor || cssColor === 'transparent') {
       return { r: 0, g: 0, b: 0, a: 0 };
@@ -414,7 +495,14 @@ class PDFExporter {
     }
   }
 
-  // Enhanced CSS length parsing with more units and calc() support
+  /**
+   * Enhanced CSS length parsing with comprehensive unit support and calc() expressions
+   * Supports: px, pt, em, rem, ex, ch, vw, vh, vmin, vmax, %, in, cm, mm, pc, calc()
+   * @param {string} cssValue - CSS length value to parse
+   * @param {number} baseFontSize - Base font size for relative units (default: 12)
+   * @param {number} containerSize - Container size for percentage calculations (default: 0)
+   * @returns {number} Parsed length value in pixels
+   */
   static _parseCssLength(cssValue, baseFontSize = 12, containerSize = 0) {
     if (!cssValue || cssValue === 'auto' || cssValue === 'inherit') return 0;
     
@@ -744,7 +832,13 @@ class PDFExporter {
   }
 
   // Recursively process inline <strong>,<em>,<span style> etc.
-  _processInline(node, styleState) {
+  _processInline(node, styleState, depth = 0) {
+    // Prevent excessive recursion that could cause stack overflow
+    const maxDepth = 100;
+    if (depth > maxDepth) {
+      this._addWarning(`Inline element nesting depth ${depth} exceeds maximum ${maxDepth}, skipping deeper elements`);
+      return;
+    }
     if (node.nodeType === Node.TEXT_NODE) {
       const txt = this._normalizeWhiteSpace(node.textContent);
       if (txt.length) this._drawStyledText(txt, styleState);
@@ -813,7 +907,7 @@ class PDFExporter {
         this._ensureSpace(1); // Ensure we have space on a new page if needed
         // No further processing for BR itself, it just moves the cursor.
       } else {
-        Array.from(node.childNodes).forEach(child => this._processInline(child, newStyle));
+        Array.from(node.childNodes).forEach(child => this._processInline(child, newStyle, depth + 1));
       }
     }
   }
@@ -821,6 +915,13 @@ class PDFExporter {
   // Nested lists with indent and ASCII bullet (now customizable)
   _drawList(listEl, level, styleState, isOrdered) {
     try {
+      // Prevent excessive nesting that could cause stack overflow
+      const maxNestingLevel = 20;
+      if (level > maxNestingLevel) {
+        this._addWarning(`List nesting level ${level} exceeds maximum ${maxNestingLevel}, skipping deeper levels`);
+        return;
+      }
+      
       const items = Array.from(listEl.children).filter(el => el.tagName === 'LI');
       const cs = this._getStyle(listEl);
       const listStyleType = cs.listStyleType || (isOrdered ? 'decimal' : 'disc');
@@ -894,7 +995,7 @@ class PDFExporter {
             return;
           }
           
-          this._processInline(childNode, itemContentStyle);
+          this._processInline(childNode, itemContentStyle, 0);
           // Check if _processInline actually drew something and moved the cursor.
           if (this.cursorY < yPosBeforeItem) {
               contentWasProcessed = true;
@@ -910,7 +1011,12 @@ class PDFExporter {
         Array.from(li.children).forEach(childLiElement => {
           if (['UL','OL'].includes(childLiElement.tagName)) {
             // Nested lists start at 'level+1'. Their indent is relative to page margin.
-            this._drawList(childLiElement, level + 1, styleState, childLiElement.tagName === 'OL');
+            // Additional safety check for deep nesting
+            if (level + 1 <= 20) {
+              this._drawList(childLiElement, level + 1, styleState, childLiElement.tagName === 'OL');
+            } else {
+              this._addWarning(`Skipping deeply nested list at level ${level + 1}`);
+            }
           }
         });
       });
@@ -1248,7 +1354,7 @@ class PDFExporter {
 
     Array.from(el.childNodes).forEach(child => {
       if (child.nodeType === 3) {
-        this._processInline(child, childStyleState);
+        this._processInline(child, childStyleState, 0);
       } else if (child.nodeType === 1) {
         const tag = child.tagName.toUpperCase(); // Ensure tag is uppercase
         // Plugin renderer override
@@ -1387,11 +1493,13 @@ class PDFExporter {
     // This method will find all <img> tags, load their data (handling async operations),
     // standardize them (e.g., via canvas), and store results in this.imageDataCache.
     const imagePromises = [];
-    elements.forEach(element => {
-      element.querySelectorAll('img').forEach(img => {
-        const promise = (async () => {
-          let src = img.getAttribute('src'); // Define src here to be available in catch
-          try {
+    
+    try {
+      elements.forEach(element => {
+        element.querySelectorAll('img').forEach(img => {
+          const promise = (async () => {
+            let src = img.getAttribute('src'); // Define src here to be available in catch
+            try {
             if (!src) return;
 
             let response;
@@ -1418,6 +1526,10 @@ class PDFExporter {
 
             // Use a canvas to convert to a data URL (PNG for transparency, JPEG otherwise)
             // This standardizes the format and makes embedding easier.
+            if (this.isNodeEnvironment) {
+              this._addWarning('Image processing not fully supported in Node.js environment');
+              return;
+            }
             const canvas = document.createElement('canvas');
             canvas.width = imageBitmap.width;
             canvas.height = imageBitmap.height;
@@ -1443,14 +1555,15 @@ class PDFExporter {
       });
 
       // Handle <canvas> elements
-      element.querySelectorAll('canvas').forEach(canvasEl => {
-        const promise = (async () => {
-          try {
-            if (canvasEl.width === 0 || canvasEl.height === 0) {
-                console.warn("Canvas element has zero width or height, skipping.", canvasEl);
-                return;
-            }
-            const dataUrl = canvasEl.toDataURL('image/png'); // Default to PNG for transparency
+      if (!this.isNodeEnvironment) {
+        element.querySelectorAll('canvas').forEach(canvasEl => {
+          const promise = (async () => {
+            try {
+              if (canvasEl.width === 0 || canvasEl.height === 0) {
+                  console.warn("Canvas element has zero width or height, skipping.", canvasEl);
+                  return;
+              }
+              const dataUrl = canvasEl.toDataURL('image/png'); // Default to PNG for transparency
             this.imageDataCache.set(canvasEl, {
               dataUrl,
               type: 'image/png',
@@ -1464,9 +1577,14 @@ class PDFExporter {
         })();
         imagePromises.push(promise);
       });
+      }
     });
 
-    await Promise.all(imagePromises);
+      await Promise.all(imagePromises);
+    } catch (error) {
+      this._handleError('Image preprocessing failed', error);
+      // Continue execution even if image loading fails
+    }
   }
 
   _drawImage(imgElement, styleState) {
@@ -1637,13 +1755,19 @@ class PDFExporter {
     out += 'startxref\n' + xref + '\n%%EOF';
 
     // Download
-    const blob = new Blob([out], { type: 'application/pdf' });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = filename;
-    a.click();
-    URL.revokeObjectURL(url);
+    if (this.isNodeEnvironment) {
+      // In Node.js environment, return the PDF content instead of downloading
+      this._addWarning('File download not supported in Node.js environment. PDF content returned as string.');
+      return out;
+    } else {
+      const blob = new Blob([out], { type: 'application/pdf' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = filename;
+      a.click();
+      URL.revokeObjectURL(url);
+    }
   }
 
   static async init(opts = {}) {
@@ -1709,7 +1833,29 @@ class PDFExporter {
 
   _escapePDFString(text) {
     if (typeof text !== 'string') return '';
-    return text.replace(/\\/g, '\\\\').replace(/\(/g, '\\(').replace(/\)/g, '\\)');
+    
+    try {
+      return text
+        // Escape backslashes first (must be done before other escapes)
+        .replace(/\\/g, '\\\\')
+        // Escape parentheses
+        .replace(/\(/g, '\\(')
+        .replace(/\)/g, '\\)')
+        // Escape other special PDF characters
+        .replace(/\r/g, '\\r')
+        .replace(/\n/g, '\\n')
+        .replace(/\t/g, '\\t')
+        .replace(/\b/g, '\\b')
+        .replace(/\f/g, '\\f')
+        // Escape non-printable ASCII characters
+        .replace(/[\x00-\x1F\x7F]/g, (match) => {
+          const code = match.charCodeAt(0);
+          return '\\' + code.toString(8).padStart(3, '0');
+        });
+    } catch (error) {
+      this._handleError('PDF string escaping failed', error);
+      return String(text).replace(/[\\()]/g, '\\$&'); // Basic fallback
+    }
   }
 
   _addLinkAnnotation(rect, uri) {
@@ -1941,7 +2087,7 @@ class PDFExporter {
     try {
       // Process paragraph with inline elements
       Array.from(pEl.childNodes).forEach(child => {
-        this._processInline(child, styleState);
+        this._processInline(child, styleState, 0);
       });
       
       // Add paragraph spacing
@@ -2056,7 +2202,7 @@ class PDFExporter {
           fontKey: 'I' // Italic for captions
         };
         Array.from(figureEl.childNodes).forEach(child => {
-          this._processInline(child, captionStyle);
+          this._processInline(child, captionStyle, 0);
         });
       }
     } catch (error) {
@@ -2075,7 +2221,7 @@ class PDFExporter {
         // Style summary as bold
         const summaryStyle = { ...styleState, fontKey: 'B' };
         Array.from(detailsEl.childNodes).forEach(child => {
-          this._processInline(child, summaryStyle);
+          this._processInline(child, summaryStyle, 0);
         });
       }
     } catch (error) {
@@ -2162,7 +2308,7 @@ class PDFExporter {
       } else {
         // Inline code
         Array.from(codeEl.childNodes).forEach(child => {
-          this._processInline(child, codeStyle);
+          this._processInline(child, codeStyle, 0);
         });
       }
     } catch (error) {
@@ -2179,7 +2325,7 @@ class PDFExporter {
           // Definition term - bold
           const dtStyle = { ...styleState, fontKey: 'B' };
           Array.from(child.childNodes).forEach(node => {
-            this._processInline(node, dtStyle);
+            this._processInline(node, dtStyle, 0);
           });
         } else if (tag === 'DD') {
           // Definition description - indented
@@ -2188,7 +2334,7 @@ class PDFExporter {
             indent: (styleState.indent || 0) + this.bulletIndent 
           };
           Array.from(child.childNodes).forEach(node => {
-            this._processInline(node, ddStyle);
+            this._processInline(node, ddStyle, 0);
           });
         }
       });
@@ -2202,7 +2348,7 @@ class PDFExporter {
       // Style address as italic
       const addressStyle = { ...styleState, fontKey: 'I' };
       Array.from(addressEl.childNodes).forEach(child => {
-        this._processInline(child, addressStyle);
+        this._processInline(child, addressStyle, 0);
       });
     } catch (error) {
       this._handleError('Processing address failed', error);
