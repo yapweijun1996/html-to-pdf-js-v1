@@ -94,6 +94,8 @@ class PDFExporter {
     return text.length * size * 0.5;
   }
 
+  // Parse CSS color strings (rgb/rgba, #rrggbb, hsl/hsla) with optional alpha
+  // Returns {r:0,g:0,b:0,a:0} (transparent black) on parse failure.
   static _parseCssColor(cssColor) {
     // Parse rgb/rgba with optional alpha, and #rrggbb
     var m = cssColor.match(/rgba?\((\d+),\s*(\d+),\s*(\d+)(?:,\s*([01]?\.?\d*))?\)/);
@@ -158,6 +160,7 @@ class PDFExporter {
   }
 
   // Parse CSS length strings (px, pt, em) into numeric px; defaults 0.
+  // Returns 0 on parse failure or for 'auto'.
   static _parseCssLength(cssValue, baseFontSize = 0) {
     if (!cssValue || cssValue === 'auto') return 0;
     const m = cssValue.match(/^([\d.]+)(px|pt|em)?$/);
@@ -236,17 +239,65 @@ class PDFExporter {
   _drawList(listEl, level, styleState, isOrdered) {
     const items = Array.from(listEl.children).filter(el => el.tagName === 'LI');
     items.forEach((li, idx) => {
-      // Determine bullet based on list type and nesting level
-      const bullet = isOrdered
+      this._ensureSpace(1); // Ensure space for at least one line for the bullet/item.
+
+      const bulletText = isOrdered
         ? this.olBulletFormat(idx, level)
         : this.ulBulletSymbols[level % this.ulBulletSymbols.length];
-      this._drawStyledText(
-        bullet + li.textContent.trim(),
-        { ...styleState, indent: this.bulletIndent * level }
-      );
-      Array.from(li.children).forEach(child => {
-        if (['UL','OL'].includes(child.tagName))
-          this._drawList(child, level+1, styleState, child.tagName==='OL');
+
+      const liBaseIndent = this.bulletIndent * level;
+      const yPosBeforeItem = this.cursorY;
+
+      // Draw bullet text using _drawCell directly for precise control.
+      this._drawCell(bulletText, styleState.fontKey, styleState.size, this.margin + liBaseIndent, yPosBeforeItem, styleState.color);
+
+      // Calculate indent for the actual list item content, flowing next to the bullet.
+      const bulletWidth = this._textWidth(bulletText, styleState.size);
+      // Add a small gap (e.g., 20% of font size) after the bullet before the content starts.
+      const contentIndent = liBaseIndent + bulletWidth + (styleState.size * 0.2);
+
+      // Create style state for the LI's content.
+      // _processInline will be called for childNodes, and it (via _drawStyledText)
+      // will use this new 'indent' and the current 'this.cursorY'.
+      const itemContentStyle = { ...styleState, indent: contentIndent };
+      
+      // Reset cursor Y for the content processing to align vertically with the bullet.
+      // _processInline will then draw text starting from this Y position.
+      this.cursorY = yPosBeforeItem;
+
+      let contentWasProcessed = false;
+      Array.from(li.childNodes).forEach(childNode => {
+        // Skip child nodes that are themselves lists (they are handled separately below)
+        // and skip purely whitespace text nodes for the purpose of the contentWasProcessed flag.
+        if (childNode.nodeType === Node.ELEMENT_NODE && (childNode.tagName === 'UL' || childNode.tagName === 'OL')) {
+          return;
+        }
+        if (childNode.nodeType === Node.TEXT_NODE && childNode.textContent.trim() === '') {
+          return;
+        }
+        
+        this._processInline(childNode, itemContentStyle);
+        // Check if _processInline actually drew something and moved the cursor.
+        // It's possible it processed an empty text node or an element that rendered nothing.
+        if (this.cursorY < yPosBeforeItem) {
+            contentWasProcessed = true;
+        }
+      });
+
+      // If no actual inline content was processed (e.g., <li></li> or <li><p></p></li> where <p> is empty,
+      // or if _processInline didn't move the cursor), we still need to account for the line height of the bullet.
+      if (!contentWasProcessed) {
+        this.cursorY = yPosBeforeItem - (styleState.size * 1.2); // Move cursor down for the bullet's line.
+      }
+      // If content was processed, cursorY is already updated by _drawStyledText calls within _processInline.
+
+      // Process nested lists that are direct children of this LI.
+      Array.from(li.children).forEach(childLiElement => {
+        if (['UL','OL'].includes(childLiElement.tagName)) {
+          // Nested lists start at 'level+1'. Their indent is relative to page margin.
+          // The styleState for nested lists should be the original styleState, not itemContentStyle.
+          this._drawList(childLiElement, level + 1, styleState, childLiElement.tagName === 'OL');
+        }
       });
     });
   }
@@ -444,6 +495,20 @@ class PDFExporter {
           this._measureTable(td, styleState);
           this._layoutTable(td);
           this._renderTable(td, styleState);
+        } else if (tag === 'HR') {
+          this._ensureSpace(1); 
+          const hrY = this.cursorY - (styleState.size * 0.6); // Position rule in approx middle of current line space
+          const x1 = this.margin;
+          const x2 = this.pageWidth - this.margin;
+          this._write(`${x1.toFixed(3)} ${hrY.toFixed(3)} m ${x2.toFixed(3)} ${hrY.toFixed(3)} l S
+`); // Stroke a line
+          this.cursorY -= styleState.size * 1.2; // Advance cursor by one line height
+        } else if (tag === 'BLOCKQUOTE') {
+          const quoteStyle = { ...styleState, indent: (styleState.indent || 0) + (this.bulletIndent || 20) };
+          this.cursorY -= (this.fontSizes.normal * 0.5); // Simulate a small top margin for the blockquote
+          this._ensureSpace(1); // Ensure space before processing blockquote's content
+          this._processBlock(child, quoteStyle); // 'child' is the BLOCKQUOTE element, process its children with new style
+          this.cursorY -= (this.fontSizes.normal * 0.5); // Simulate a small bottom margin
         } else {
           this._processBlock(child, styleState);
         }
@@ -457,30 +522,50 @@ class PDFExporter {
 
   save(filename) {
     // Finalize streams for each page
+    // Each page in a PDF has one or more content streams. These streams contain
+    // the actual drawing commands (text, lines, colors, etc.) for that page.
+    // Here, we're taking all the commands accumulated for each page and formatting
+    // them into the PDF stream syntax, including calculating their length.
     this.pages.forEach(function(p) {
       const content = this.streams[p.cid].join('');
       const stream = '<< /Length ' + content.length + ' >> stream\n' + content + '\nendstream\n';
       this.objects[p.cid - 1] = stream;
     }, this);
 
-    // Pages tree
+    // Pages tree (/Type /Pages)
+    // This is a dictionary object that acts as the root of the page tree.
+    // It contains a count of all pages and an array (/Kids) of indirect references
+    // to each individual Page object.
     const kids = this.pages.map(p => p.pid + ' 0 R').join(' ');
     const pagesObj = this._addObject('<< /Type /Pages /Count ' + this.pages.length + ' /Kids [' + kids + '] >>');
 
-    // Update parent references
+    // Update parent references in each Page object (/Type /Page)
+    // Each Page object needs to point back to the Pages tree object as its /Parent.
+    // We initially put '0 0 R' as a placeholder; now we replace it.
     this.objects = this.objects.map(obj => obj.replace('/Parent 0 0 R', '/Parent ' + pagesObj + ' 0 R'));
 
-    // Catalog
+    // Catalog object (/Type /Catalog)
+    // This is the root object of the PDF file. It primarily points to the Pages tree object,
+    // telling the PDF reader where to find the pages.
     const catalog = this._addObject('<< /Type /Catalog /Pages ' + pagesObj + ' 0 R >>');
 
     // Build PDF
+    // Start with the PDF header, indicating the version.
     let out = '%PDF-1.3\n';
+    // Append each PDF object (streams, fonts, pages, catalog, etc.) sequentially.
+    // Each object is numbered (e.g., "1 0 obj ... endobj").
+    // We also record the byte offset of each object's start, for the XRef table.
     this.objects.forEach((obj, i) => {
       this.offsets[i] = out.length;
       out += (i+1) + ' 0 obj\n' + obj + 'endobj\n';
     });
 
-    // Xref
+    // Cross-reference table (XRef)
+    // This table lists the byte offset of each indirect object in the file.
+    // It allows random access to objects, which is essential for PDF readers.
+    // It starts with "xref", then the range of object numbers (0 to N),
+    // and then entries for each object: offset (10 digits), generation number (5 digits), and 'n' (in-use) or 'f' (free).
+    // Object 0 is special and always has offset 0, generation 65535, and 'f'.
     const xref = out.length;
     out += 'xref\n0 ' + (this.objects.length+1) + '\n';
     out += '0000000000 65535 f \n';
@@ -489,6 +574,10 @@ class PDFExporter {
     });
 
     // Trailer
+    // This is found at the end of the PDF. It tells the reader:
+    // - /Size: Total number of objects in the XRef table.
+    // - /Root: An indirect reference to the Catalog object (the document's root).
+    // It also gives the byte offset of the 'xref' keyword (startxref).
     out += 'trailer<< /Size ' + (this.objects.length+1) + ' /Root ' + catalog + ' 0 R >>\n';
     out += 'startxref\n' + xref + '\n%%EOF';
 
