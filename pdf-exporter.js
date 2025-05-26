@@ -60,9 +60,9 @@ class PDFExporter {
 
       // Built-in fonts with error handling
       try {
-        // Allow customizable header font (default to regular Helvetica for headers)
-        const headerFont = opts.headerFont || 'Helvetica';
-        this.fH = this._addObject(`<< /Type /Font /Subtype /Type1 /BaseFont /${headerFont} >>`); // Header font
+        // Use Helvetica-Bold for headers to distinguish from regular bold text
+        const headerFont = opts.headerFont || 'Helvetica-Bold';
+        this.fH = this._addObject(`<< /Type /Font /Subtype /Type1 /BaseFont /${headerFont} >>`); // Header font (bold)
         this.fB = this._addObject('<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica-Bold >>'); // Bold font
         this.fI = this._addObject('<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica-Oblique >>'); // Italic font
         this.fN = this._addObject('<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>'); // Normal font
@@ -888,9 +888,39 @@ class PDFExporter {
 
       const newStyle = { ...styleState };
       const tag = node.tagName.toUpperCase();
-      if (tag === 'STRONG' || tag === 'B') newStyle.fontKey = 'B';
-      if (tag === 'EM' || tag === 'I') newStyle.fontKey = 'I';
       
+      // Determine font based on CSS properties and element type
+      let fontKey = styleState.fontKey || 'N';
+      
+      // Check CSS font-weight and font-style
+      const fontWeight = cs.fontWeight || 'normal';
+      const fontStyle = cs.fontStyle || 'normal';
+      
+      // Handle semantic tags first
+      if (tag === 'STRONG' || tag === 'B') {
+        fontKey = 'B';
+      } else if (tag === 'EM' || tag === 'I') {
+        fontKey = 'I';
+      } else if (['CODE', 'KBD', 'SAMP', 'VAR'].includes(tag)) {
+        fontKey = 'M';
+      } else {
+        // Handle CSS-based font styling
+        const isBold = fontWeight === 'bold' || fontWeight === 'bolder' || parseInt(fontWeight) >= 600;
+        const isItalic = fontStyle === 'italic' || fontStyle === 'oblique';
+        
+        if (isBold && isItalic) {
+          // For bold+italic, use bold (PDF Type1 fonts don't have bold-italic variants)
+          fontKey = 'B';
+        } else if (isBold) {
+          fontKey = 'B';
+        } else if (isItalic) {
+          fontKey = 'I';
+        } else {
+          fontKey = 'N';
+        }
+      }
+      
+      newStyle.fontKey = fontKey;
       newStyle.color = cs.color ? PDFExporter._parseCssColor(cs.color) : styleState.color;
       newStyle.size = PDFExporter._parseCssLength(cs.fontSize, styleState.size) || styleState.size;
 
@@ -931,12 +961,7 @@ class PDFExporter {
       if (tag === 'SMALL') {
         newStyle.size = (newStyle.size || this.fontSizes.normal) * 0.85; // Reduce font size slightly
       }
-      if (['CODE', 'KBD', 'SAMP', 'VAR'].includes(tag)) {
-        newStyle.fontKey = 'M'; // Use Monospace font
-        // Optionally, slightly different background for code blocks if not styled by CSS.
-        // For now, just changing fontKey. CSS background-color on these elements would be respected by _processBlock if they were block.
-        // For inline, if a specific background is desired for code, it can be added similarly to <mark>
-      }
+
 
       // Recursively process all child nodes with inherited styles
       // except for <br> which is handled directly to force a line break.
@@ -965,12 +990,12 @@ class PDFExporter {
       const listStyleType = cs.listStyleType || (isOrdered ? 'decimal' : 'disc');
       
       // Get precise measurements from HTML computed styles
-      const listPaddingLeft = PDFExporter._parseCssLength(cs.paddingLeft, styleState.size);
-      const listMarginLeft = PDFExporter._parseCssLength(cs.marginLeft, styleState.size);
+      const listPaddingLeft = PDFExporter._parseCssLength(cs.paddingLeft, styleState.size) || 40;
+      const listMarginLeft = PDFExporter._parseCssLength(cs.marginLeft, styleState.size) || 0;
       
       // Calculate precise indentation based on HTML styles
-      // Default browser list indentation is typically 40px (padding-left)
-      const baseIndent = listPaddingLeft || 40;
+      // Use actual browser list indentation patterns
+      const baseIndent = listPaddingLeft;
       const levelIndent = baseIndent * (level + 1);
       
       items.forEach((li, idx) => {
@@ -987,8 +1012,18 @@ class PDFExporter {
                   bulletText = this._getOrdinal(idx, listStyleType);
               }
           } else { // Unordered list
-              // Use custom bullet symbols per list level
-              bulletText = this.ulBulletSymbols[level % this.ulBulletSymbols.length];
+              // Use different bullet symbols based on list style type and level
+              if (listStyleType === 'disc' || listStyleType === 'circle' || listStyleType === 'square') {
+                const bulletSymbols = {
+                  'disc': ['•', '◦', '▪'],
+                  'circle': ['◦', '•', '▪'],
+                  'square': ['▪', '•', '◦']
+                };
+                bulletText = bulletSymbols[listStyleType][level % 3] + ' ';
+              } else {
+                // Use custom bullet symbols per list level
+                bulletText = this.ulBulletSymbols[level % this.ulBulletSymbols.length];
+              }
           }
         }
 
@@ -996,12 +1031,11 @@ class PDFExporter {
         
         // Get LI computed styles for precise positioning
         const liCs = this._getStyle(li);
-        const liPaddingLeft = PDFExporter._parseCssLength(liCs.paddingLeft, styleState.size);
-        const liMarginLeft = PDFExporter._parseCssLength(liCs.marginLeft, styleState.size);
+        const liPaddingLeft = PDFExporter._parseCssLength(liCs.paddingLeft, styleState.size) || 0;
+        const liMarginLeft = PDFExporter._parseCssLength(liCs.marginLeft, styleState.size) || 0;
         
-        // Calculate bullet position - typically 16px from the left edge of the list
-        const bulletIndentFromList = 16; // Standard browser bullet position
-        const bulletX = this.margin + (styleState.indent || 0) + levelIndent - bulletIndentFromList;
+        // Calculate bullet position - position bullet at the start of the list's padding area
+        const bulletX = this.margin + (styleState.indent || 0) + levelIndent - 20; // 20px before content start
 
         // Draw bullet text using _drawCell directly for precise control.
         if (bulletText) {
@@ -1010,7 +1044,7 @@ class PDFExporter {
 
         // Calculate indent for the actual list item content
         // Content starts at the list's padding-left position
-        const contentIndent = (styleState.indent || 0) + levelIndent + liPaddingLeft;
+        const contentIndent = (styleState.indent || 0) + levelIndent;
 
         // Create style state for the LI's content.
         const itemContentStyle = { 
@@ -1023,6 +1057,8 @@ class PDFExporter {
         this.cursorY = yPosBeforeItem;
 
         let contentWasProcessed = false;
+        let initialCursorY = this.cursorY;
+        
         Array.from(li.childNodes).forEach(childNode => {
           // Skip child nodes that are themselves lists (they are handled separately below)
           // and skip purely whitespace text nodes for the purpose of the contentWasProcessed flag.
@@ -1035,7 +1071,7 @@ class PDFExporter {
           
           this._processInline(childNode, itemContentStyle, 0);
           // Check if _processInline actually drew something and moved the cursor.
-          if (this.cursorY < yPosBeforeItem) {
+          if (this.cursorY !== initialCursorY) {
               contentWasProcessed = true;
           }
         });
@@ -1283,10 +1319,17 @@ class PDFExporter {
     const parentIndent = styleState.indent || 0;
     const parentAvailableWidth = styleState.availableWidth || (this.pageWidth - 2 * this.margin - parentIndent);
 
-    // Margins
-    const mt = PDFExporter._parseCssLength(cs.marginTop, baseFontSize);
-    this.cursorY -= mt;
-    this._ensureSpace(0); // Check for new page after margin top
+    // Margins - handle all sides for proper spacing
+    const marginTop = PDFExporter._parseCssLength(cs.marginTop, baseFontSize) || 0;
+    const marginBottom = PDFExporter._parseCssLength(cs.marginBottom, baseFontSize) || 0;
+    const marginLeft = PDFExporter._parseCssLength(cs.marginLeft, baseFontSize) || 0;
+    const marginRight = PDFExporter._parseCssLength(cs.marginRight, baseFontSize) || 0;
+    
+    // Apply margin top
+    if (marginTop > 0) {
+      this.cursorY -= marginTop;
+      this._ensureSpace(0); // Check for new page after margin top
+    }
 
     // Padding
     const pt = PDFExporter._parseCssLength(cs.paddingTop, baseFontSize);
@@ -1294,13 +1337,13 @@ class PDFExporter {
     const pb = PDFExporter._parseCssLength(cs.paddingBottom, baseFontSize);
     const pl = PDFExporter._parseCssLength(cs.paddingLeft, baseFontSize);
 
-    // Determine content width for this block
+    // Determine content width for this block, accounting for margins and padding
     const parsedCssWidth = PDFExporter._parseCssLength(cs.width, baseFontSize);
     let currentBlockContentWidth;
     if (parsedCssWidth > 0) {
-        currentBlockContentWidth = Math.min(parsedCssWidth, parentAvailableWidth - pl - pr); // Cannot exceed parent's available content width minus own padding
+        currentBlockContentWidth = Math.min(parsedCssWidth, parentAvailableWidth - pl - pr - marginLeft - marginRight);
     } else {
-        currentBlockContentWidth = parentAvailableWidth - pl - pr;
+        currentBlockContentWidth = parentAvailableWidth - pl - pr - marginLeft - marginRight;
     }
 
     // Background and Border calculations need to consider padding and the block's actual content width.
@@ -1472,9 +1515,12 @@ class PDFExporter {
     }
 
     this.cursorY -= pb; // Apply padding bottom
-    const mb = PDFExporter._parseCssLength(cs.marginBottom, baseFontSize);
-    this.cursorY -= mb;
-    this._ensureSpace(0); // Check for new page after margin bottom
+    
+    // Apply margin bottom
+    if (marginBottom > 0) {
+      this.cursorY -= marginBottom;
+      this._ensureSpace(0); // Check for new page after margin bottom
+    }
   }
 
   _drawBorders(x, y, w, h, widths, colors, styles) {
@@ -1590,13 +1636,13 @@ class PDFExporter {
 
       // Handle <canvas> elements
       element.querySelectorAll('canvas').forEach(canvasEl => {
-          const promise = (async () => {
-            try {
-              if (canvasEl.width === 0 || canvasEl.height === 0) {
-                  console.warn("Canvas element has zero width or height, skipping.", canvasEl);
-                  return;
-              }
-              const dataUrl = canvasEl.toDataURL('image/png'); // Default to PNG for transparency
+        const promise = (async () => {
+          try {
+            if (canvasEl.width === 0 || canvasEl.height === 0) {
+                console.warn("Canvas element has zero width or height, skipping.", canvasEl);
+                return;
+            }
+            const dataUrl = canvasEl.toDataURL('image/png'); // Default to PNG for transparency
             this.imageDataCache.set(canvasEl, {
               dataUrl,
               type: 'image/png',
@@ -1610,29 +1656,6 @@ class PDFExporter {
         })();
         imagePromises.push(promise);
       });
-
-      // Handle <canvas> elements
-      element.querySelectorAll('canvas').forEach(canvasEl => {
-        const promise = (async () => {
-          try {
-            if (canvasEl.width === 0 || canvasEl.height === 0) {
-                console.warn("Canvas element has zero width or height, skipping.", canvasEl);
-                return;
-            }
-            const dataUrl = canvasEl.toDataURL('image/png'); // Default to PNG for transparency
-          this.imageDataCache.set(canvasEl, {
-            dataUrl,
-            type: 'image/png',
-            width: canvasEl.width,
-            height: canvasEl.height
-          });
-        } catch (error) {
-          console.error('Error processing canvas:', canvasEl, error);
-          this.imageDataCache.set(canvasEl, { error: true }); // Mark as errored
-        }
-      })();
-      imagePromises.push(promise);
-    });
     });
 
       await Promise.all(imagePromises);
@@ -1654,54 +1677,101 @@ class PDFExporter {
     }
 
     const cs = this._getStyle(imgElement);
-    let imgWidth = PDFExporter._parseCssLength(cs.width, styleState.size) || imageData.width;
-    let imgHeight = PDFExporter._parseCssLength(cs.height, styleState.size) || imageData.height;
-    const aspectRatio = imageData.width / imageData.height;
-
-    if (cs.width && !cs.height) {
+    const naturalWidth = imageData.width;
+    const naturalHeight = imageData.height;
+    const aspectRatio = naturalWidth / naturalHeight;
+    
+    // Get CSS dimensions
+    const cssWidth = PDFExporter._parseCssLength(cs.width, styleState.size);
+    const cssHeight = PDFExporter._parseCssLength(cs.height, styleState.size);
+    
+    // Calculate final dimensions with proper aspect ratio preservation
+    let imgWidth, imgHeight;
+    
+    if (cssWidth && cssHeight) {
+      // Both dimensions specified - use as is (may distort)
+      imgWidth = cssWidth;
+      imgHeight = cssHeight;
+    } else if (cssWidth && !cssHeight) {
+      // Width specified, calculate height to maintain aspect ratio
+      imgWidth = cssWidth;
       imgHeight = imgWidth / aspectRatio;
-    } else if (!cs.width && cs.height) {
+    } else if (!cssWidth && cssHeight) {
+      // Height specified, calculate width to maintain aspect ratio
+      imgHeight = cssHeight;
       imgWidth = imgHeight * aspectRatio;
-    } else if (!cs.width && !cs.height) {
-      // No CSS dimensions, use natural image dimensions but cap at page width
-      const maxWidth = this.pageWidth - 2 * this.margin - (styleState.indent || 0);
-      if (imgWidth > maxWidth) {
+    } else {
+      // No CSS dimensions, use natural dimensions but constrain to page width
+      const maxWidth = (styleState.availableWidth || (this.pageWidth - 2 * this.margin)) - (styleState.indent || 0);
+      
+      if (naturalWidth > maxWidth) {
         imgWidth = maxWidth;
         imgHeight = imgWidth / aspectRatio;
+      } else {
+        imgWidth = naturalWidth;
+        imgHeight = naturalHeight;
       }
-    } // If both cs.width and cs.height are set, they are used as is.
+    }
+    
+    // Ensure image fits on page height-wise
+    const maxHeight = this.pageHeight - this.margin - 50; // Leave some margin
+    if (imgHeight > maxHeight) {
+      imgHeight = maxHeight;
+      imgWidth = imgHeight * aspectRatio;
+    }
 
-    this._ensureSpace(imgHeight / this.leading); // Approximate lines needed
+    this._ensureSpace(Math.ceil(imgHeight / this.leading)); // Approximate lines needed
     if (this.cursorY < imgHeight + this.margin) {
         this._newPage();
     }
 
     // For PDF, image data is typically base64 decoded if it was a data URL.
-    // The `dataUrl` from canvas is already base64 encoded (e.g. "data:image/jpeg;base64,ABCD...").
     const base64Data = imageData.dataUrl.substring(imageData.dataUrl.indexOf(',') + 1);
 
     let imageObjId;
-    // For JPEG, we can embed directly. For PNG, we need to handle it differently (alpha channel etc.)
-    // Simplified: For this step, we assume DCTDecode for JPEG like data.
-    // A robust solution would properly handle PNG (e.g. with FlateDecode and SMask for transparency).
+    // Improved image embedding with better format handling
     if (imageData.type === 'image/jpeg') {
         imageObjId = this._addObject(
-        `<< /Type /XObject /Subtype /Image /Width ${imageData.width} /Height ${imageData.height} ` +
+        `<< /Type /XObject /Subtype /Image /Width ${naturalWidth} /Height ${naturalHeight} ` +
         `/ColorSpace /DeviceRGB /BitsPerComponent 8 /Filter /DCTDecode /Length ${base64Data.length} >> stream\n` +
         base64Data + '\nendstream'
         );
     } else if (imageData.type === 'image/png') {
-        // Basic PNG embedding - this is simplified and won't handle all PNG features (like true alpha masks correctly in all viewers)
-        // For full PNG support, FlateDecode, predictor, and potentially an SMask for alpha are needed.
-        // This example will embed it like a JPEG for now, which might lose transparency.
-        // A proper PNG implementation is a large task.
-        console.warn("Simplified PNG embedding. Transparency might be lost or rendered incorrectly.");
-        imageObjId = this._addObject(
-            `<< /Type /XObject /Subtype /Image /Width ${imageData.width} /Height ${imageData.height} ` +
+        // Convert PNG to JPEG for better PDF compatibility
+        // This loses transparency but ensures consistent rendering
+        try {
+          // Create a canvas to convert PNG to JPEG
+          const canvas = document.createElement('canvas');
+          canvas.width = naturalWidth;
+          canvas.height = naturalHeight;
+          const ctx = canvas.getContext('2d');
+          
+          // Fill with white background for transparency
+          ctx.fillStyle = '#FFFFFF';
+          ctx.fillRect(0, 0, naturalWidth, naturalHeight);
+          
+          // Draw the image
+          const img = new Image();
+          img.src = imageData.dataUrl;
+          ctx.drawImage(img, 0, 0);
+          
+          // Convert to JPEG
+          const jpegDataUrl = canvas.toDataURL('image/jpeg', 0.85);
+          const jpegBase64 = jpegDataUrl.substring(jpegDataUrl.indexOf(',') + 1);
+          
+          imageObjId = this._addObject(
+            `<< /Type /XObject /Subtype /Image /Width ${naturalWidth} /Height ${naturalHeight} ` +
+            `/ColorSpace /DeviceRGB /BitsPerComponent 8 /Filter /DCTDecode /Length ${jpegBase64.length} >> stream\n` +
+            jpegBase64 + '\nendstream'
+          );
+        } catch (error) {
+          console.warn("PNG to JPEG conversion failed, using original PNG data:", error);
+          imageObjId = this._addObject(
+            `<< /Type /XObject /Subtype /Image /Width ${naturalWidth} /Height ${naturalHeight} ` +
             `/ColorSpace /DeviceRGB /BitsPerComponent 8 /Filter /DCTDecode /Length ${base64Data.length} >> stream\n` +
             base64Data + '\nendstream'
-        );
-        // TODO: Implement proper PNG embedding with FlateDecode and SMask for alpha channel.
+          );
+        }
     } else {
         console.error("Unsupported image type for PDF embedding:", imageData.type);
         return;
