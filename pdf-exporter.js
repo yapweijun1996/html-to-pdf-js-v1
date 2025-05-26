@@ -18,6 +18,13 @@ class PDFExporter {
     this.leading = this.fontSizes.normal * 1.2;
     this.bulletIndent = opts.bulletIndent || 20;
     this.tableCellPadding = opts.tableCellPadding || 5;
+    // Custom list bullet settings
+    this.ulBulletSymbols = Array.isArray(opts.ulBulletSymbols) && opts.ulBulletSymbols.length
+      ? opts.ulBulletSymbols
+      : ['- '];
+    this.olBulletFormat = typeof opts.olBulletFormat === 'function'
+      ? opts.olBulletFormat
+      : ((idx, level) => `${idx+1}. `);
 
     // Built-in fonts
     this.fH = this._addObject('<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica-Bold >>');
@@ -205,12 +212,18 @@ class PDFExporter {
     }
   }
 
-  // Nested lists with indent and ASCII bullet
+  // Nested lists with indent and ASCII bullet (now customizable)
   _drawList(listEl, level, styleState, isOrdered) {
     const items = Array.from(listEl.children).filter(el => el.tagName === 'LI');
     items.forEach((li, idx) => {
-      const bullet = isOrdered ? `${idx+1}. ` : '- ';
-      this._drawStyledText(bullet + li.textContent.trim(), { ...styleState, indent: this.bulletIndent * level });
+      // Determine bullet based on list type and nesting level
+      const bullet = isOrdered
+        ? this.olBulletFormat(idx, level)
+        : this.ulBulletSymbols[level % this.ulBulletSymbols.length];
+      this._drawStyledText(
+        bullet + li.textContent.trim(),
+        { ...styleState, indent: this.bulletIndent * level }
+      );
       Array.from(li.children).forEach(child => {
         if (['UL','OL'].includes(child.tagName))
           this._drawList(child, level+1, styleState, child.tagName==='OL');
