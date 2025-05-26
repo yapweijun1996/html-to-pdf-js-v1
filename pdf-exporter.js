@@ -1,8 +1,8 @@
 // pdf-exporter.js
 // Zero-dependency PDF engine: headings (H1,H2), paragraphs, lists, tables, text wrapping
 
-var PDFExporter = (function() {
-  function PDF() {
+class PDFExporter {
+  constructor() {
     this.objects = [];
     this.offsets = [];
     this.pages = [];
@@ -17,14 +17,22 @@ var PDFExporter = (function() {
     this.fB = this._addObject('<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica-Bold >>');
     this.fI = this._addObject('<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica-Oblique >>');
     this.fN = this._addObject('<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>');
+    // Set up off-screen canvas for accurate text measurement
+    try {
+      const canvas = document.createElement('canvas');
+      this.ctx = canvas.getContext('2d');
+    } catch (e) {
+      this.ctx = null;
+    }
+    this.fontFamily = 'Helvetica';
   }
 
-  PDF.prototype._addObject = function(content) {
+  _addObject(content) {
     this.objects.push(content);
     return this.objects.length;
-  };
+  }
 
-  PDF.prototype._newPage = function() {
+  _newPage() {
     var cid = this._addObject('');
     var pid = this._addObject(
       '<< /Type /Page /Parent 0 0 R /MediaBox [0 0 ' + this.pageWidth + ' ' + this.pageHeight + '] ' +
@@ -34,24 +42,30 @@ var PDFExporter = (function() {
     this.pages.push({ pid: pid, cid: cid });
     this.streams[cid] = '';
     this.cursorY = this.pageHeight - this.margin;
-  };
+  }
 
-  PDF.prototype._write = function(txt) {
+  _write(txt) {
     var cid = this.pages[this.pages.length - 1].cid;
     this.streams[cid] += txt;
-  };
+  }
 
-  PDF.prototype._ensureSpace = function(lines) {
+  _ensureSpace(lines) {
     if (this.cursorY < lines * this.leading + this.margin) {
       this._newPage();
     }
-  };
+  }
 
-  PDF.prototype._textWidth = function(text, size) {
+  _textWidth(text, size) {
+    if (this.ctx) {
+      // Use canvas measureText for accurate width
+      this.ctx.font = size + 'px ' + this.fontFamily;
+      return this.ctx.measureText(text).width;
+    }
+    // Fallback heuristic
     return text.length * size * 0.5;
-  };
+  }
 
-  PDF.prototype._drawText = function(text, style) {
+  _drawText(text, style) {
     var fontKey = 'N', size = this.fontSizes.normal;
     if (style === 'h1') { fontKey = 'H'; size = this.fontSizes.h1; }
     else if (style === 'h2') { fontKey = 'B'; size = this.fontSizes.h2; }
@@ -68,9 +82,9 @@ var PDFExporter = (function() {
       }
     }
     if (line) this.text(line.trim(), style);
-  };
+  }
 
-  PDF.prototype.text = function(txt, style) {
+  text(txt, style) {
     this._ensureSpace(1);
     var fontKey = 'N', size = this.fontSizes.normal;
     if (style === 'h1') { fontKey = 'H'; size = this.fontSizes.h1; }
@@ -84,9 +98,9 @@ var PDFExporter = (function() {
       ') Tj ET\n'
     );
     this.cursorY -= size * 1.2;
-  };
+  }
 
-  PDF.prototype.save = function(filename) {
+  save(filename) {
     this.pages.forEach(function(p) {
       var content = this.streams[p.cid];
       var stream =
@@ -134,10 +148,10 @@ var PDFExporter = (function() {
     a.download = filename;
     a.click();
     URL.revokeObjectURL(url);
-  };
+  }
 
-  function init(opts) {
-    var pdf = new PDF();
+  static init(opts) {
+    var pdf = new PDFExporter();
     pdf._newPage();
     var els = document.querySelectorAll(opts.selector);
     els.forEach(function(el) {
@@ -162,6 +176,7 @@ var PDFExporter = (function() {
     });
     pdf.save(opts.filename);
   }
+}
 
-  return { init: init };
-})();
+// Expose to global
+window.PDFExporter = PDFExporter;
