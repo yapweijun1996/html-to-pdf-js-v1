@@ -7,8 +7,17 @@ class PDFExporter {
     this.offsets = [];
     this.pages = [];
     this.streams = {};
-    this.pageWidth = opts.pageWidth || 595.28;
-    this.pageHeight = opts.pageHeight || 841.89;
+    // Page size & orientation presets
+    const _sizes = {
+      A4: [595.28, 841.89],
+      Letter: [612, 792]
+    };
+    let [pw, ph] = opts.pageSize && _sizes[opts.pageSize]
+      ? _sizes[opts.pageSize]
+      : [opts.pageWidth || 595.28, opts.pageHeight || 841.89];
+    if (opts.landscape) [pw, ph] = [ph, pw];
+    this.pageWidth = pw;
+    this.pageHeight = ph;
     this.margin = opts.margin != null ? opts.margin : 40;
     this.fontSizes = {
       h1: opts.h1FontSize || 24,
@@ -36,6 +45,8 @@ class PDFExporter {
     catch(e) { this.ctx = null; }
     this.fontFamily = opts.fontFamily || 'Helvetica';
     this.styleCache = new WeakMap();
+    // Hook called after each new page is created: (pdfInstance, pageIndex)
+    this.onPage = typeof opts.onPage === 'function' ? opts.onPage : null;
   }
 
   _addObject(content) {
@@ -53,6 +64,8 @@ class PDFExporter {
     this.pages.push({ pid, cid });
     this.streams[cid] = [];
     this.cursorY = this.pageHeight - this.margin;
+    // Invoke onPage hook for custom header/footer drawing
+    if (this.onPage) this.onPage(this, this.pages.length);
   }
 
   _write(txt) {
