@@ -409,17 +409,15 @@ class PDFExporter {
             }
         } else { // Unordered list
             switch (listStyleType) {
-                case 'disc':
-                    bulletText = '\u2022 '; // •
-                    break;
                 case 'circle':
-                    bulletText = '\u25E6 '; // ◦
+                    bulletText = '◦ '; // ◦
                     break;
                 case 'square':
-                    bulletText = '\u25AA '; // ▪ (or use \u25A0 ■ for filled square)
+                    bulletText = '▪ '; // ▪ (or use ■ ■ for filled square)
                     break;
-                default:
-                    bulletText = this.ulBulletSymbols[level % this.ulBulletSymbols.length] || '- ';
+                case 'disc': // Explicitly handle disc
+                default: // For any other listStyleType not explicitly circle or square, default to disc
+                    bulletText = '• '; // •
                     break;
             }
         }
@@ -724,8 +722,10 @@ class PDFExporter {
           return;
         }
         if (tag==='H1') {
+          console.log('PDFExporter H1 content:', child.textContent.trim()); // Diagnostic log
           this._drawStyledText(child.textContent.trim(), { fontKey:'H', size:this.fontSizes.h1, color:styleState.color, indent:styleState.indent });
         } else if (tag==='H2') {
+          console.log('PDFExporter H2 content:', child.textContent.trim()); // Diagnostic log
           this._drawStyledText(child.textContent.trim(), { fontKey:'B', size:this.fontSizes.h2, color:styleState.color, indent:styleState.indent });
         } else if (tag==='P') {
           this._drawStyledText(child.textContent.trim(), styleState);
