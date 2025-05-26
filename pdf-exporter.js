@@ -72,25 +72,19 @@ class PDFExporter {
         throw new Error('Critical error: Cannot initialize PDF fonts');
       }
       
-      // Canvas for text measurement with robust fallback
+      // Canvas for text measurement with fallback
       this.ctx = null;
       this._lastFontSpec = null;
-      this.isNodeEnvironment = typeof window === 'undefined' || typeof document === 'undefined';
       
-      if (!this.isNodeEnvironment) {
-        try { 
-          const c = document.createElement('canvas'); 
-          this.ctx = c.getContext('2d');
-          if (!this.ctx) {
-            this._addWarning('Canvas context not available, using fallback text measurement');
-            this.ctx = this._createFallbackContext();
-          }
-        } catch(e) { 
-          this._addWarning('Canvas not available, using fallback text measurement');
+      try { 
+        const c = document.createElement('canvas'); 
+        this.ctx = c.getContext('2d');
+        if (!this.ctx) {
+          this._addWarning('Canvas context not available, using fallback text measurement');
           this.ctx = this._createFallbackContext();
         }
-      } else {
-        this._addWarning('Running in Node.js environment, using fallback text measurement');
+      } catch(e) { 
+        this._addWarning('Canvas not available, using fallback text measurement');
         this.ctx = this._createFallbackContext();
       }
       
@@ -1570,10 +1564,6 @@ class PDFExporter {
 
             // Use a canvas to convert to a data URL (PNG for transparency, JPEG otherwise)
             // This standardizes the format and makes embedding easier.
-            if (this.isNodeEnvironment) {
-              this._addWarning('Image processing not fully supported in Node.js environment');
-              return;
-            }
             const canvas = document.createElement('canvas');
             canvas.width = imageBitmap.width;
             canvas.height = imageBitmap.height;
@@ -1599,8 +1589,7 @@ class PDFExporter {
       });
 
       // Handle <canvas> elements
-      if (!this.isNodeEnvironment) {
-        element.querySelectorAll('canvas').forEach(canvasEl => {
+      element.querySelectorAll('canvas').forEach(canvasEl => {
           const promise = (async () => {
             try {
               if (canvasEl.width === 0 || canvasEl.height === 0) {
@@ -1621,7 +1610,29 @@ class PDFExporter {
         })();
         imagePromises.push(promise);
       });
-      }
+
+      // Handle <canvas> elements
+      element.querySelectorAll('canvas').forEach(canvasEl => {
+        const promise = (async () => {
+          try {
+            if (canvasEl.width === 0 || canvasEl.height === 0) {
+                console.warn("Canvas element has zero width or height, skipping.", canvasEl);
+                return;
+            }
+            const dataUrl = canvasEl.toDataURL('image/png'); // Default to PNG for transparency
+          this.imageDataCache.set(canvasEl, {
+            dataUrl,
+            type: 'image/png',
+            width: canvasEl.width,
+            height: canvasEl.height
+          });
+        } catch (error) {
+          console.error('Error processing canvas:', canvasEl, error);
+          this.imageDataCache.set(canvasEl, { error: true }); // Mark as errored
+        }
+      })();
+      imagePromises.push(promise);
+    });
     });
 
       await Promise.all(imagePromises);
@@ -1799,19 +1810,13 @@ class PDFExporter {
     out += 'startxref\n' + xref + '\n%%EOF';
 
     // Download
-    if (this.isNodeEnvironment) {
-      // In Node.js environment, return the PDF content instead of downloading
-      this._addWarning('File download not supported in Node.js environment. PDF content returned as string.');
-      return out;
-    } else {
-      const blob = new Blob([out], { type: 'application/pdf' });
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement('a');
-      a.href = url;
-      a.download = filename;
-      a.click();
-      URL.revokeObjectURL(url);
-    }
+    const blob = new Blob([out], { type: 'application/pdf' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = filename;
+    a.click();
+    URL.revokeObjectURL(url);
   }
 
   static async init(opts = {}) {

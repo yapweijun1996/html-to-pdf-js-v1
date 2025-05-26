@@ -1,0 +1,40 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>PDF Exporter Test</title>
+</head>
+<body>
+    <div id="content">
+        <h1>Test Document</h1>
+        <p>This is a test paragraph to verify the PDF exporter works correctly in a browser environment.</p>
+        <ul>
+            <li>First item</li>
+            <li>Second item</li>
+        </ul>
+    </div>
+    
+    <button onclick="generatePDF()">Generate PDF</button>
+    
+    <script src="pdf-exporter.js"></script>
+    <script>
+        async function generatePDF() {
+            try {
+                console.log('Starting PDF generation...');
+                const result = await PDFExporter.init({
+                    selector: '#content',
+                    filename: 'test-document.pdf',
+                    debug: true
+                });
+                console.log('PDF generated successfully:', result);
+            } catch (error) {
+                console.error('PDF generation failed:', error);
+            }
+        }
+        
+        // Test that PDFExporter is available
+        console.log('PDFExporter available:', typeof PDFExporter !== 'undefined');
+    </script>
+</body>
+</html> 
