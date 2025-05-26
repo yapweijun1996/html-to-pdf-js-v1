@@ -176,12 +176,10 @@ class PDFExporter {
     let rowCursor = 0;
     const allRows = [...tableData.headers.map(r=>({cells:r, header:true})), ...tableData.rows.map(r=>({cells:r, header:false}))];
     const drawGrid = yTop => {
-      // horizontal lines
       for (let i=0;i<=allRows.length && i<=rowCursor+1;i++) {
         const y = yTop - i*cellH;
         this._write(`${x0} ${y} m ${x0+totalW} ${y} l S\n`);
       }
-      // vertical lines
       let acc = x0;
       widths.forEach(w=>{
         this._write(`${acc} ${yTop} m ${acc} ${yTop - cellH*(rowCursor+1)} l S\n`);
@@ -226,19 +224,17 @@ class PDFExporter {
     const cs = window.getComputedStyle(el);
     const mt = parseFloat(cs.marginTop) || 0;
     this.cursorY -= mt;
-    // background
     const bg = cs.backgroundColor;
     if (bg && bg!=='transparent') {
       const c = PDFExporter._parseCssColor(bg);
       const x = this.margin;
       const width = this.pageWidth - 2*this.margin;
-      const height = parseFloat(cs.height) || 0; // estimate
+      const height = parseFloat(cs.height) || 0;
       const y = this.cursorY - height;
       this._write(`${c.r.toFixed(3)} ${c.g.toFixed(3)} ${c.b.toFixed(3)} rg\n`);
       this._write(`${x} ${y} ${width} ${height} re f\n`);
       this._write('0 0 0 rg\n');
     }
-    // border
     const bw = parseFloat(cs.borderWidth) || 0;
     if (bw>0) {
       const bc = PDFExporter._parseCssColor(cs.borderColor);
@@ -247,13 +243,11 @@ class PDFExporter {
       const y = this.cursorY - (parseFloat(cs.height)||0);
       const w = this.pageWidth - 2*this.margin;
       const h = parseFloat(cs.height) || 0;
-      // draw rectangle border
       this._write(`${x} ${y} ${w} ${h} re S\n`);
       this._write('0 0 0 RG\n');
     }
     const pt = parseFloat(cs.paddingTop) || 0;
     this.cursorY -= pt;
-    // dispatch children
     Array.from(el.childNodes).forEach(child => {
       if (child.nodeType === 3) this._processInline(child, styleState);
       else if (child.nodeType===1) {
