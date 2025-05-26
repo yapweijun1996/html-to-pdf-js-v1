@@ -40,13 +40,13 @@ class PDFExporter {
       '/H ' + this.fH + ' 0 R /B ' + this.fB + ' 0 R /I ' + this.fI + ' 0 R /N ' + this.fN + ' 0 R >> >> >>'
     );
     this.pages.push({ pid: pid, cid: cid });
-    this.streams[cid] = '';
+    this.streams[cid] = [];
     this.cursorY = this.pageHeight - this.margin;
   }
 
   _write(txt) {
     var cid = this.pages[this.pages.length - 1].cid;
-    this.streams[cid] += txt;
+    this.streams[cid].push(txt);
   }
 
   _ensureSpace(lines) {
@@ -102,7 +102,8 @@ class PDFExporter {
 
   save(filename) {
     this.pages.forEach(function(p) {
-      var content = this.streams[p.cid];
+      // Join the buffered text for each page
+      var content = this.streams[p.cid].join('');
       var stream =
         '<< /Length ' + content.length + ' >> stream\n' +
         content +
@@ -150,6 +151,82 @@ class PDFExporter {
     URL.revokeObjectURL(url);
   }
 
+  static _parseCssColor(cssColor) {
+    var m = cssColor.match(/rgba?\((\d+),\s*(\d+),\s*(\d+)/);
+    if (m) {
+      return {
+        r: parseInt(m[1], 10) / 255,
+        g: parseInt(m[2], 10) / 255,
+        b: parseInt(m[3], 10) / 255
+      };
+    }
+    m = cssColor.match(/^#([0-9a-fA-F]{6})$/);
+    if (m) {
+      var hex = parseInt(m[1], 16);
+      return {
+        r: ((hex >> 16) & 0xFF) / 255,
+        g: ((hex >> 8) & 0xFF) / 255,
+        b: (hex & 0xFF) / 255
+      };
+    }
+    // Default to black
+    return { r: 0, g: 0, b: 0 };
+  }
+
+  // Draw a single line of styled text with proper wrapping, color, and font
+  _drawStyledLine(text, styleState) {
+    this._ensureSpace(1);
+    const { fontKey, size, color } = styleState;
+    const y = this.cursorY;
+    let cmd = 'BT /' + fontKey + ' ' + size + ' Tf ';
+    if (color) {
+      cmd += color.r.toFixed(3) + ' ' + color.g.toFixed(3) + ' ' + color.b.toFixed(3) + ' rg ';
+    }
+    cmd += this.margin + ' ' + y + ' Td (' +
+      text.replace(/\(/g, '\\(').replace(/\)/g, '\\)').replace(/\\/g, '\\\\') +
+      ') Tj ET\n';
+    this._write(cmd);
+    this.cursorY -= size * 1.2;
+  }
+
+  // Draw styled text with line wrapping
+  _drawStyledText(text, styleState) {
+    const { size } = styleState;
+    const maxWidth = this.pageWidth - 2 * this.margin;
+    const words = text.split(' ');
+    let line = '';
+    for (let i = 0; i < words.length; i++) {
+      const testLine = line + words[i] + ' ';
+      if (this._textWidth(testLine, size) > maxWidth && line) {
+        this._drawStyledLine(line.trim(), styleState);
+        line = words[i] + ' ';
+      } else {
+        line = testLine;
+      }
+    }
+    if (line) this._drawStyledLine(line.trim(), styleState);
+  }
+
+  // Recursively process inline nodes to handle bold, italic, and color
+  _processInline(node, styleState) {
+    Array.from(node.childNodes).forEach(child => {
+      if (child.nodeType === 3) { // TEXT_NODE
+        const txt = child.textContent.trim();
+        if (txt) this._drawStyledText(txt, styleState);
+      } else if (child.nodeType === 1) { // ELEMENT_NODE
+        const newStyle = Object.assign({}, styleState);
+        const tag = child.tagName.toUpperCase();
+        if (tag === 'STRONG' || tag === 'B') newStyle.fontKey = 'B';
+        if (tag === 'EM' || tag === 'I') newStyle.fontKey = 'I';
+        const inlineColor = child.style.color || window.getComputedStyle(child).color;
+        if (inlineColor) newStyle.color = PDFExporter._parseCssColor(inlineColor);
+        const inlineSize = child.style.fontSize || window.getComputedStyle(child).fontSize;
+        if (inlineSize && inlineSize.endsWith('px')) newStyle.size = parseFloat(inlineSize);
+        this._processInline(child, newStyle);
+      }
+    });
+  }
+
   static init(opts) {
     var pdf = new PDFExporter();
     pdf._newPage();
@@ -157,9 +234,25 @@ class PDFExporter {
     els.forEach(function(el) {
       Array.from(el.children).forEach(function(child) {
         var tag = child.tagName;
-        if (tag === 'H1') pdf._drawText(child.textContent, 'h1');
-        else if (tag === 'H2') pdf._drawText(child.textContent, 'h2');
-        else if (tag === 'P') pdf._drawText(child.textContent);
+        if (tag === 'H1') {
+          pdf._processInline(child, {
+            fontKey: 'H',
+            size: pdf.fontSizes.h1,
+            color: { r: 0, g: 0, b: 0 }
+          });
+        } else if (tag === 'H2') {
+          pdf._processInline(child, {
+            fontKey: 'B',
+            size: pdf.fontSizes.h2,
+            color: { r: 0, g: 0, b: 0 }
+          });
+        } else if (tag === 'P') {
+          pdf._processInline(child, {
+            fontKey: 'N',
+            size: pdf.fontSizes.normal,
+            color: { r: 0, g: 0, b: 0 }
+          });
+        }
         else if (tag === 'UL')
           Array.from(child.querySelectorAll('li')).forEach(function(li) {
             pdf._drawText('• ' + li.textContent);
