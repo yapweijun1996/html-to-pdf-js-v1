@@ -66,6 +66,19 @@ class PDFExporter {
     return text.length * size * 0.5;
   }
 
+  static _parseCssColor(cssColor) {
+    var m = cssColor.match(/rgba?\((\d+),\s*(\d+),\s*(\d+)/);
+    if (m) {
+      return { r: parseInt(m[1], 10)/255, g: parseInt(m[2], 10)/255, b: parseInt(m[3], 10)/255 };
+    }
+    m = cssColor.match(/^#([0-9a-fA-F]{6})$/);
+    if (m) {
+      var hex = parseInt(m[1], 16);
+      return { r: ((hex>>16)&0xFF)/255, g: ((hex>>8)&0xFF)/255, b: (hex&0xFF)/255 };
+    }
+    return { r: 0, g: 0, b: 0 };
+  }
+
   // Low-level draw a single text run at x,y
   _drawCell(text, fontKey, size, x, y, color) {
     const safe = text.replace(/\\/g, '\\\\').replace(/\(/g, '\\(').replace(/\)/g, '\\)');
