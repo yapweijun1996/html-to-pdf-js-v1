@@ -7,6 +7,7 @@ class PDFExporter {
     this.offsets = [];
     this.pages = [];
     this.streams = {};
+    this.imageDataCache = new WeakMap(); // For storing preprocessed image data
     // Page size & orientation presets
     const _sizes = {
       A4: [595.28, 841.89],
@@ -58,14 +59,22 @@ class PDFExporter {
 
   _newPage() {
     const cid = this._addObject('');
+
+    // Create a separate object for page resources (fonts, XObjects)
+    // This object will be referenced by the Page object.
+    // Initially, it only contains fonts. XObjects will be added later.
+    const fontResources = `<< /H ${this.fH} 0 R /B ${this.fB} 0 R /I ${this.fI} 0 R /N ${this.fN} 0 R >>`;
+    const pageResourcesContent = `<< /Font ${fontResources} /XObject << >> >>`; // Placeholder for XObjects
+    const resId = this._addObject(pageResourcesContent);
+
     const pid = this._addObject(
       `<< /Type /Page /Parent 0 0 R /MediaBox [0 0 ${this.pageWidth} ${this.pageHeight}] ` +
-      `/Contents ${cid} 0 R /Resources << /Font << ` +
-      `/H ${this.fH} 0 R /B ${this.fB} 0 R /I ${this.fI} 0 R /N ${this.fN} 0 R >> >> >>`
+      `/Contents ${cid} 0 R /Resources ${resId} 0 R >>`
     );
-    this.pages.push({ pid, cid });
+    this.pages.push({ pid, cid, resId, imageResourceMap: {} }); // Store resId and map for image resources
     this.streams[cid] = [];
     this.cursorY = this.pageHeight - this.margin;
+    this.currentPageImageCounter = 0; // For naming image resources on this page (e.g., Im1, Im2)
     // Invoke onPage hook for custom header/footer drawing
     if (this.onPage) this.onPage(this, this.pages.length);
   }
@@ -500,8 +509,7 @@ class PDFExporter {
           const hrY = this.cursorY - (styleState.size * 0.6); // Position rule in approx middle of current line space
           const x1 = this.margin;
           const x2 = this.pageWidth - this.margin;
-          this._write(`${x1.toFixed(3)} ${hrY.toFixed(3)} m ${x2.toFixed(3)} ${hrY.toFixed(3)} l S
-`); // Stroke a line
+          this._write(`${x1.toFixed(3)} ${hrY.toFixed(3)} m ${x2.toFixed(3)} ${hrY.toFixed(3)} l S\n`); // Stroke a line
           this.cursorY -= styleState.size * 1.2; // Advance cursor by one line height
         } else if (tag === 'BLOCKQUOTE') {
           const quoteStyle = { ...styleState, indent: (styleState.indent || 0) + (this.bulletIndent || 20) };
@@ -509,6 +517,8 @@ class PDFExporter {
           this._ensureSpace(1); // Ensure space before processing blockquote's content
           this._processBlock(child, quoteStyle); // 'child' is the BLOCKQUOTE element, process its children with new style
           this.cursorY -= (this.fontSizes.normal * 0.5); // Simulate a small bottom margin
+        } else if (tag === 'IMG') {
+          this._drawImage(child, styleState);
         } else {
           this._processBlock(child, styleState);
         }
@@ -518,6 +528,153 @@ class PDFExporter {
     this.cursorY -= pb;
     const mb = PDFExporter._parseCssLength(cs.marginBottom, styleState.size);
     this.cursorY -= mb;
+  }
+
+  // Placeholder for image preprocessing - will be implemented in a subsequent step
+  async _loadAndPreprocessImages(elements) {
+    // This method will find all <img> tags, load their data (handling async operations),
+    // standardize them (e.g., via canvas), and store results in this.imageDataCache.
+    const imagePromises = [];
+    elements.forEach(element => {
+      element.querySelectorAll('img').forEach(img => {
+        const promise = (async () => {
+          try {
+            const src = img.getAttribute('src');
+            if (!src) return;
+
+            let response;
+            let imageBitmap;
+            let type = 'image/jpeg'; // Default type
+
+            if (src.startsWith('data:')) {
+              response = await fetch(src);
+              const MimeTypeMatch = src.match(/^data:(image\/[a-z]+);base64,/);
+              if (MimeTypeMatch) type = MimeTypeMatch[1];
+              imageBitmap = await createImageBitmap(await response.blob());
+            } else {
+              response = await fetch(src);
+              if (!response.ok) {
+                console.error(`Failed to fetch image: ${src}`, response.statusText);
+                return;
+              }
+              const blob = await response.blob();
+              type = blob.type;
+              imageBitmap = await createImageBitmap(blob);
+            }
+
+            if (!imageBitmap) return;
+
+            // Use a canvas to convert to a data URL (PNG for transparency, JPEG otherwise)
+            // This standardizes the format and makes embedding easier.
+            const canvas = document.createElement('canvas');
+            canvas.width = imageBitmap.width;
+            canvas.height = imageBitmap.height;
+            const ctx = canvas.getContext('2d');
+            ctx.drawImage(imageBitmap, 0, 0);
+            
+            // Prefer PNG if original type suggests transparency, or if it's not JPEG. Otherwise, JPEG.
+            const outputType = (type === 'image/png' || type === 'image/gif' || type === 'image/svg+xml') ? 'image/png' : 'image/jpeg';
+            const dataUrl = canvas.toDataURL(outputType, outputType === 'image/jpeg' ? 0.85 : undefined);
+
+            this.imageDataCache.set(img, {
+              dataUrl,
+              type: outputType, // Store the type of the dataUrl (image/jpeg or image/png)
+              width: imageBitmap.width,
+              height: imageBitmap.height
+            });
+          } catch (error) {
+            console.error('Error processing image:', src, error);
+            this.imageDataCache.set(img, { error: true }); // Mark as errored
+          }
+        })();
+        imagePromises.push(promise);
+      });
+    });
+
+    await Promise.all(imagePromises);
+  }
+
+  _drawImage(imgElement, styleState) {
+    const imageData = this.imageDataCache.get(imgElement);
+    if (!imageData || imageData.error) {
+      // Optionally render alt text or a placeholder if image failed to load
+      const altText = imgElement.getAttribute('alt');
+      if (altText) {
+        this._drawStyledText(`[Image: ${altText}]`, styleState);
+      }
+      return;
+    }
+
+    const cs = this._getStyle(imgElement);
+    let imgWidth = PDFExporter._parseCssLength(cs.width, styleState.size) || imageData.width;
+    let imgHeight = PDFExporter._parseCssLength(cs.height, styleState.size) || imageData.height;
+    const aspectRatio = imageData.width / imageData.height;
+
+    if (cs.width && !cs.height) {
+      imgHeight = imgWidth / aspectRatio;
+    } else if (!cs.width && cs.height) {
+      imgWidth = imgHeight * aspectRatio;
+    } else if (!cs.width && !cs.height) {
+      // No CSS dimensions, use natural image dimensions but cap at page width
+      const maxWidth = this.pageWidth - 2 * this.margin - (styleState.indent || 0);
+      if (imgWidth > maxWidth) {
+        imgWidth = maxWidth;
+        imgHeight = imgWidth / aspectRatio;
+      }
+    } // If both cs.width and cs.height are set, they are used as is.
+
+    this._ensureSpace(imgHeight / this.leading); // Approximate lines needed
+    if (this.cursorY < imgHeight + this.margin) {
+        this._newPage();
+    }
+
+    // For PDF, image data is typically base64 decoded if it was a data URL.
+    // The `dataUrl` from canvas is already base64 encoded (e.g. "data:image/jpeg;base64,ABCD...").
+    const base64Data = imageData.dataUrl.substring(imageData.dataUrl.indexOf(',') + 1);
+
+    let imageObjId;
+    // For JPEG, we can embed directly. For PNG, we need to handle it differently (alpha channel etc.)
+    // Simplified: For this step, we assume DCTDecode for JPEG like data.
+    // A robust solution would properly handle PNG (e.g. with FlateDecode and SMask for transparency).
+    if (imageData.type === 'image/jpeg') {
+        imageObjId = this._addObject(
+        `<< /Type /XObject /Subtype /Image /Width ${imageData.width} /Height ${imageData.height} ` +
+        `/ColorSpace /DeviceRGB /BitsPerComponent 8 /Filter /DCTDecode /Length ${base64Data.length} >> stream\n` +
+        base64Data + '\nendstream'
+        );
+    } else if (imageData.type === 'image/png') {
+        // Basic PNG embedding - this is simplified and won't handle all PNG features (like true alpha masks correctly in all viewers)
+        // For full PNG support, FlateDecode, predictor, and potentially an SMask for alpha are needed.
+        // This example will embed it like a JPEG for now, which might lose transparency.
+        // A proper PNG implementation is a large task.
+        console.warn("Simplified PNG embedding. Transparency might be lost or rendered incorrectly.");
+        imageObjId = this._addObject(
+            `<< /Type /XObject /Subtype /Image /Width ${imageData.width} /Height ${imageData.height} ` +
+            `/ColorSpace /DeviceRGB /BitsPerComponent 8 /Filter /DCTDecode /Length ${base64Data.length} >> stream\n` +
+            base64Data + '\nendstream'
+        );
+        // TODO: Implement proper PNG embedding with FlateDecode and SMask for alpha channel.
+    } else {
+        console.error("Unsupported image type for PDF embedding:", imageData.type);
+        return;
+    }
+
+    const currentPage = this.pages[this.pages.length - 1];
+    currentPage.currentPageImageCounter = (currentPage.currentPageImageCounter || 0) + 1;
+    const imgResourceName = `Im${currentPage.currentPageImageCounter}`;
+    currentPage.imageResourceMap[imgResourceName] = imageObjId;
+
+    // Drawing the image
+    const x = this.margin + (styleState.indent || 0);
+    const y = this.cursorY - imgHeight;
+    this._write('q\n'); // Save graphics state
+    this._write(`${imgWidth.toFixed(3)} 0 0 ${imgHeight.toFixed(3)} ${x.toFixed(3)} ${y.toFixed(3)} cm\n`); // Concat matrix: scale and translate
+    this._write(`/${imgResourceName} Do\n`); // Draw the image XObject
+    this._write('Q\n'); // Restore graphics state
+
+    this.cursorY -= imgHeight;
+    // Add a small margin after the image
+    this.cursorY -= this.leading * 0.2;
   }
 
   save(filename) {
@@ -530,6 +687,20 @@ class PDFExporter {
       const content = this.streams[p.cid].join('');
       const stream = '<< /Length ' + content.length + ' >> stream\n' + content + '\nendstream\n';
       this.objects[p.cid - 1] = stream;
+
+      // If there are image resources for this page, update the resource object
+      if (Object.keys(p.imageResourceMap).length > 0) {
+        let xobjectEntries = '';
+        for (const imgName in p.imageResourceMap) {
+          xobjectEntries += `/${imgName} ${p.imageResourceMap[imgName]} 0 R `;
+        }
+        // Fetch the existing Font resources part
+        const currentResourceObjContent = this.objects[p.resId - 1];
+        const fontMatch = currentResourceObjContent.match(/\/Font\s*(<<.*?>>)/);
+        const fontResourcesString = fontMatch ? fontMatch[1] : '<< >>';
+        
+        this.objects[p.resId - 1] = `<< /Font ${fontResourcesString} /XObject << ${xobjectEntries.trim()} >> >>`;
+      }
     }, this);
 
     // Pages tree (/Type /Pages)
@@ -591,11 +762,16 @@ class PDFExporter {
     URL.revokeObjectURL(url);
   }
 
-  static init(opts = {}) {
+  static async init(opts = {}) { // init is now async
     const pdf = new PDFExporter(opts);
+    const rootElements = Array.from(document.querySelectorAll(opts.selector));
+    
+    // Preprocess images before starting PDF generation
+    await pdf._loadAndPreprocessImages(rootElements);
+
     pdf._newPage();
     const defaultStyle = { fontKey:'N', size:pdf.fontSizes.normal, color:{r:0,g:0,b:0}, indent:0 };
-    document.querySelectorAll(opts.selector).forEach(root => {
+    rootElements.forEach(root => {
       pdf._processBlock(root, defaultStyle);
     });
     pdf.save(opts.filename);
