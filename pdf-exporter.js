@@ -28,6 +28,7 @@ class PDFExporter {
     try { const c = document.createElement('canvas'); this.ctx = c.getContext('2d'); }
     catch(e) { this.ctx = null; }
     this.fontFamily = opts.fontFamily || 'Helvetica';
+    this.styleCache = new WeakMap();
   }
 
   _addObject(content) {
@@ -145,6 +146,16 @@ class PDFExporter {
     return parseFloat(cssValue) || 0;
   }
 
+  // Get and cache computed style for an element
+  _getStyle(el) {
+    let cs = this.styleCache.get(el);
+    if (!cs) {
+      cs = window.getComputedStyle(el);
+      this.styleCache.set(el, cs);
+    }
+    return cs;
+  }
+
   // Low-level draw a single text run at x,y
   _drawCell(text, fontKey, size, x, y, color) {
     const safe = text.replace(/\\/g, '\\\\').replace(/\(/g, '\\(').replace(/\)/g, '\\)');
@@ -186,7 +197,7 @@ class PDFExporter {
       const tag = node.tagName.toUpperCase();
       if (tag === 'STRONG' || tag === 'B') newStyle.fontKey = 'B';
       if (tag === 'EM' || tag === 'I') newStyle.fontKey = 'I';
-      const cs = window.getComputedStyle(node);
+      const cs = this._getStyle(node);
       if (cs.color) newStyle.color = PDFExporter._parseCssColor(cs.color);
       newStyle.size = PDFExporter._parseCssLength(cs.fontSize, styleState.size);
       // Recursively process all child nodes with inherited styles
@@ -322,7 +333,8 @@ class PDFExporter {
         accX = x0;
 
         cells.forEach((cellEl, ci) => {
-          const align = window.getComputedStyle(cellEl).textAlign;
+          const cs = this._getStyle(cellEl);
+          const align = cs.textAlign;
           const lines = linesArr[ci];
           const colW = widths[ci];
           lines.forEach((ln, li) => {
@@ -348,7 +360,7 @@ class PDFExporter {
 
   // Process any block-level element: margins, padding, background, border, then children
   _processBlock(el, styleState) {
-    const cs = window.getComputedStyle(el);
+    const cs = this._getStyle(el);
     const mt = PDFExporter._parseCssLength(cs.marginTop, styleState.size);
     this.cursorY -= mt;
     // Background fill
