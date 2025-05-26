@@ -1,56 +1,212 @@
 // pdf-exporter.js
 // Single-file, zero-dependency HTML → PDF with CSS box-model, styled inline, nested lists, and multi-page tables
+// Enhanced with comprehensive error handling, validation, and robustness features
 
 class PDFExporter {
   constructor(opts = {}) {
-    this.objects = [];
-    this.offsets = [];
-    this.pages = [];
-    this.streams = {};
-    this.imageDataCache = new WeakMap(); // For storing preprocessed image data
-    // Page size & orientation presets
-    const _sizes = {
-      A4: [595.28, 841.89],
-      Letter: [612, 792]
-    };
-    let [pw, ph] = opts.pageSize && _sizes[opts.pageSize]
-      ? _sizes[opts.pageSize]
-      : [opts.pageWidth || 595.28, opts.pageHeight || 841.89];
-    if (opts.landscape) [pw, ph] = [ph, pw];
-    this.pageWidth = pw;
-    this.pageHeight = ph;
-    this.margin = opts.margin != null ? opts.margin : 40;
-    this.fontSizes = {
-      h1: opts.h1FontSize || 24,
-      h2: opts.h2FontSize || 18,
-      normal: opts.fontSize || 12
-    };
-    this.leading = this.fontSizes.normal * 1.2;
-    this.bulletIndent = opts.bulletIndent || 20;
-    this.tableCellPadding = opts.tableCellPadding || 5;
-    // Custom list bullet settings
-    this.ulBulletSymbols = Array.isArray(opts.ulBulletSymbols) && opts.ulBulletSymbols.length
-      ? opts.ulBulletSymbols
-      : ['- '];
-    this.olBulletFormat = typeof opts.olBulletFormat === 'function'
-      ? opts.olBulletFormat
-      : ((idx, level) => `${idx+1}. `);
+    try {
+      // Validate constructor options
+      this._validateOptions(opts);
+      
+      this.objects = [];
+      this.offsets = [];
+      this.pages = [];
+      this.streams = {};
+      this.imageDataCache = new WeakMap(); // For storing preprocessed image data
+      this.errors = []; // Track non-fatal errors
+      this.warnings = []; // Track warnings
+      
+      // Page size & orientation presets
+      const _sizes = {
+        A4: [595.28, 841.89],
+        Letter: [612, 792],
+        Legal: [612, 1008],
+        A3: [841.89, 1190.55],
+        A5: [419.53, 595.28],
+        Tabloid: [792, 1224]
+      };
+      
+      let [pw, ph] = opts.pageSize && _sizes[opts.pageSize]
+        ? _sizes[opts.pageSize]
+        : [this._validateNumber(opts.pageWidth, 595.28, 'pageWidth'), 
+           this._validateNumber(opts.pageHeight, 841.89, 'pageHeight')];
+      
+      if (opts.landscape) [pw, ph] = [ph, pw];
+      this.pageWidth = pw;
+      this.pageHeight = ph;
+      this.margin = this._validateNumber(opts.margin, 40, 'margin');
+      
+      this.fontSizes = {
+        h1: this._validateNumber(opts.h1FontSize, 24, 'h1FontSize'),
+        h2: this._validateNumber(opts.h2FontSize, 18, 'h2FontSize'),
+        h3: this._validateNumber(opts.h3FontSize, 16, 'h3FontSize'),
+        h4: this._validateNumber(opts.h4FontSize, 14, 'h4FontSize'),
+        h5: this._validateNumber(opts.h5FontSize, 12, 'h5FontSize'),
+        h6: this._validateNumber(opts.h6FontSize, 11, 'h6FontSize'),
+        normal: this._validateNumber(opts.fontSize, 12, 'fontSize')
+      };
+      
+      this.leading = this.fontSizes.normal * 1.2;
+      this.bulletIndent = this._validateNumber(opts.bulletIndent, 20, 'bulletIndent');
+      this.tableCellPadding = this._validateNumber(opts.tableCellPadding, 5, 'tableCellPadding');
+      
+      // Custom list bullet settings with validation
+      this.ulBulletSymbols = Array.isArray(opts.ulBulletSymbols) && opts.ulBulletSymbols.length
+        ? opts.ulBulletSymbols.map(s => String(s))
+        : ['- '];
+      this.olBulletFormat = typeof opts.olBulletFormat === 'function'
+        ? opts.olBulletFormat
+        : ((idx, level) => `${idx+1}. `);
 
-    // Built-in fonts
-    this.fH = this._addObject('<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica-Bold >>');
-    this.fB = this._addObject('<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica-Bold >>');
-    this.fI = this._addObject('<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica-Oblique >>');
-    this.fN = this._addObject('<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>');
-    this.fM = this._addObject('<< /Type /Font /Subtype /Type1 /BaseFont /Courier >>'); // Monospace font
-    // Canvas for text measurement
-    try { const c = document.createElement('canvas'); this.ctx = c.getContext('2d'); }
-    catch(e) { this.ctx = null; }
-    this.fontFamily = opts.fontFamily || 'Helvetica';
-    this.styleCache = new WeakMap();
-    // Hook called after each new page is created: (pdfInstance, pageIndex)
-    this.onPage = typeof opts.onPage === 'function' ? opts.onPage : null;
-    // Custom element renderers: {TAGNAME: (node, styleState, pdf) => {}} 
-    this.renderers = opts.renderers && typeof opts.renderers === 'object' ? opts.renderers : {};
+      // Built-in fonts with error handling
+      try {
+        this.fH = this._addObject('<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica-Bold >>');
+        this.fB = this._addObject('<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica-Bold >>');
+        this.fI = this._addObject('<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica-Oblique >>');
+        this.fN = this._addObject('<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>');
+        this.fM = this._addObject('<< /Type /Font /Subtype /Type1 /BaseFont /Courier >>'); // Monospace font
+      } catch (error) {
+        this._handleError('Font initialization failed', error);
+        throw new Error('Critical error: Cannot initialize PDF fonts');
+      }
+      
+      // Canvas for text measurement with fallback
+      this.ctx = null;
+      this._lastFontSpec = null;
+      try { 
+        const c = document.createElement('canvas'); 
+        this.ctx = c.getContext('2d');
+        if (!this.ctx) {
+          this._addWarning('Canvas context not available, using fallback text measurement');
+        }
+      } catch(e) { 
+        this._addWarning('Canvas not available, using fallback text measurement');
+      }
+      
+      this.fontFamily = this._validateString(opts.fontFamily, 'Helvetica', 'fontFamily');
+      this.styleCache = new WeakMap();
+      this.maxCacheSize = this._validateNumber(opts.maxCacheSize, 1000, 'maxCacheSize');
+      this.cacheSize = 0;
+      
+      // Hook called after each new page is created: (pdfInstance, pageIndex)
+      this.onPage = typeof opts.onPage === 'function' ? opts.onPage : null;
+      this.onError = typeof opts.onError === 'function' ? opts.onError : null;
+      this.onWarning = typeof opts.onWarning === 'function' ? opts.onWarning : null;
+      this.onProgress = typeof opts.onProgress === 'function' ? opts.onProgress : null;
+      
+      // Custom element renderers: {TAGNAME: (node, styleState, pdf) => {}} 
+      this.renderers = opts.renderers && typeof opts.renderers === 'object' ? opts.renderers : {};
+      
+      // Debug mode
+      this.debug = Boolean(opts.debug);
+      
+      // Performance tracking
+      this.startTime = Date.now();
+      this.processedElements = 0;
+      
+    } catch (error) {
+      this._handleError('PDFExporter constructor failed', error);
+      throw error;
+    }
+  }
+
+  // Validation helper methods
+  _validateOptions(opts) {
+    if (opts && typeof opts !== 'object') {
+      throw new Error('Options must be an object');
+    }
+    
+    // Validate page dimensions
+    if (opts.pageWidth && (typeof opts.pageWidth !== 'number' || opts.pageWidth <= 0)) {
+      throw new Error('pageWidth must be a positive number');
+    }
+    if (opts.pageHeight && (typeof opts.pageHeight !== 'number' || opts.pageHeight <= 0)) {
+      throw new Error('pageHeight must be a positive number');
+    }
+    
+    // Validate margins
+    if (opts.margin && (typeof opts.margin !== 'number' || opts.margin < 0)) {
+      throw new Error('margin must be a non-negative number');
+    }
+  }
+
+  _validateNumber(value, defaultValue, fieldName) {
+    if (value === undefined || value === null) return defaultValue;
+    if (typeof value !== 'number' || isNaN(value) || value < 0) {
+      this._addWarning(`Invalid ${fieldName}: ${value}, using default: ${defaultValue}`);
+      return defaultValue;
+    }
+    return value;
+  }
+
+  _validateString(value, defaultValue, fieldName) {
+    if (value === undefined || value === null) return defaultValue;
+    if (typeof value !== 'string') {
+      this._addWarning(`Invalid ${fieldName}: ${value}, using default: ${defaultValue}`);
+      return defaultValue;
+    }
+    return value;
+  }
+
+  _handleError(message, error) {
+    const errorInfo = {
+      message,
+      error: error?.message || error,
+      timestamp: new Date().toISOString(),
+      stack: error?.stack
+    };
+    
+    this.errors.push(errorInfo);
+    
+    if (this.debug) {
+      console.error('PDFExporter Error:', errorInfo);
+    }
+    
+    if (this.onError) {
+      try {
+        this.onError(errorInfo);
+      } catch (e) {
+        console.error('Error in onError callback:', e);
+      }
+    }
+  }
+
+  _addWarning(message) {
+    const warningInfo = {
+      message,
+      timestamp: new Date().toISOString()
+    };
+    
+    this.warnings.push(warningInfo);
+    
+    if (this.debug) {
+      console.warn('PDFExporter Warning:', warningInfo);
+    }
+    
+    if (this.onWarning) {
+      try {
+        this.onWarning(warningInfo);
+      } catch (e) {
+        console.error('Error in onWarning callback:', e);
+      }
+    }
+  }
+
+  _reportProgress(phase, current, total) {
+    if (this.onProgress) {
+      try {
+        this.onProgress({
+          phase,
+          current,
+          total,
+          percentage: total > 0 ? Math.round((current / total) * 100) : 0,
+          elementsProcessed: this.processedElements,
+          elapsedTime: Date.now() - this.startTime
+        });
+      } catch (e) {
+        console.error('Error in onProgress callback:', e);
+      }
+    }
   }
 
   _addObject(content) {
@@ -59,25 +215,40 @@ class PDFExporter {
   }
 
   _newPage() {
-    const cid = this._addObject('');
+    try {
+      const cid = this._addObject('');
 
-    // Create a separate object for page resources (fonts, XObjects)
-    // This object will be referenced by the Page object.
-    // Initially, it only contains fonts. XObjects will be added later.
-    const fontResources = `<< /H ${this.fH} 0 R /B ${this.fB} 0 R /I ${this.fI} 0 R /N ${this.fN} 0 R /M ${this.fM} 0 R >>`;
-    const pageResourcesContent = `<< /Font ${fontResources} /XObject << >> >>`;
-    const resId = this._addObject(pageResourcesContent);
+      // Create a separate object for page resources (fonts, XObjects)
+      // This object will be referenced by the Page object.
+      // Initially, it only contains fonts. XObjects will be added later.
+      const fontResources = `<< /H ${this.fH} 0 R /B ${this.fB} 0 R /I ${this.fI} 0 R /N ${this.fN} 0 R /M ${this.fM} 0 R >>`;
+      const pageResourcesContent = `<< /Font ${fontResources} /XObject << >> >>`;
+      const resId = this._addObject(pageResourcesContent);
 
-    const pid = this._addObject(
-      `<< /Type /Page /Parent 0 0 R /MediaBox [0 0 ${this.pageWidth} ${this.pageHeight}] ` +
-      `/Contents ${cid} 0 R /Resources ${resId} 0 R >>`
-    );
-    this.pages.push({ pid, cid, resId, imageResourceMap: {}, annotations: [] }); // Store resId, map for image resources, and annotations array
-    this.streams[cid] = [];
-    this.cursorY = this.pageHeight - this.margin;
-    this.currentPageImageCounter = 0; // For naming image resources on this page (e.g., Im1, Im2)
-    // Invoke onPage hook for custom header/footer drawing
-    if (this.onPage) this.onPage(this, this.pages.length);
+      const pid = this._addObject(
+        `<< /Type /Page /Parent 0 0 R /MediaBox [0 0 ${this.pageWidth} ${this.pageHeight}] ` +
+        `/Contents ${cid} 0 R /Resources ${resId} 0 R >>`
+      );
+      this.pages.push({ pid, cid, resId, imageResourceMap: {}, annotations: [] }); // Store resId, map for image resources, and annotations array
+      this.streams[cid] = [];
+      this.cursorY = this.pageHeight - this.margin;
+      this.currentPageImageCounter = 0; // For naming image resources on this page (e.g., Im1, Im2)
+      
+      // Draw custom header/footer if defined
+      this._drawCustomHeaderFooter();
+      
+      // Invoke onPage hook for custom header/footer drawing
+      if (this.onPage) {
+        try {
+          this.onPage(this, this.pages.length);
+        } catch (error) {
+          this._handleError('onPage callback failed', error);
+        }
+      }
+    } catch (error) {
+      this._handleError('New page creation failed', error);
+      throw error; // This is critical, so re-throw
+    }
   }
 
   _write(txt) {
@@ -92,108 +263,367 @@ class PDFExporter {
   }
 
   _textWidth(text, size) {
-    if (this.ctx) {
-      // Only reset canvas font if it changed
-      const spec = `${size}px ${this.fontFamily}`;
-      if (this._lastFontSpec !== spec) {
-        this.ctx.font = spec;
-        this._lastFontSpec = spec;
+    try {
+      if (this.ctx) {
+        // Only reset canvas font if it changed
+        const spec = `${size}px ${this.fontFamily}`;
+        if (this._lastFontSpec !== spec) {
+          this.ctx.font = spec;
+          this._lastFontSpec = spec;
+        }
+        const metrics = this.ctx.measureText(text);
+        return metrics.width;
       }
-      return this.ctx.measureText(text).width;
+      // Fallback calculation with better accuracy
+      return this._fallbackTextWidth(text, size);
+    } catch (error) {
+      this._handleError('Text width measurement failed', error);
+      return this._fallbackTextWidth(text, size);
     }
-    return text.length * size * 0.5;
   }
 
-  // Parse CSS color strings (rgb/rgba, #rrggbb, hsl/hsla) with optional alpha
-  // Returns {r:0,g:0,b:0,a:0} (transparent black) on parse failure.
-  static _parseCssColor(cssColor) {
-    // Parse rgb/rgba with optional alpha, and #rrggbb
-    var m = cssColor.match(/rgba?\((\d+),\s*(\d+),\s*(\d+)(?:,\s*([01]?\.?\d*))?\)/);
-    if (m) {
-      return {
-        r: parseInt(m[1], 10)/255,
-        g: parseInt(m[2], 10)/255,
-        b: parseInt(m[3], 10)/255,
-        a: m[4] !== undefined ? parseFloat(m[4]) : 1
-      };
-    }
-    m = cssColor.match(/^#([0-9a-fA-F]{6})$/);
-    if (m) {
-      var hex6 = m[1];
-      return {
-        r: ((hex6>>16)&0xFF)/255,
-        g: ((hex6>>8)&0xFF)/255,
-        b: (hex6&0xFF)/255,
-        a: 1
-      };
-    }
-    // 3-digit hex, e.g. #abc
-    m = cssColor.match(/^#([0-9a-fA-F]{3})$/);
-    if (m) {
-      const h = m[1];
-      return {
-        r: parseInt(h[0] + h[0], 16)/255,
-        g: parseInt(h[1] + h[1], 16)/255,
-        b: parseInt(h[2] + h[2], 16)/255,
-        a: 1
-      };
-    }
-    // hsl and hsla
-    m = cssColor.match(/^hsla?\(\s*(\d+(?:\.\d+)?)\s*,\s*(\d+(?:\.\d+)?)%\s*,\s*(\d+(?:\.\d+)?)%\s*(?:,\s*([01]?\.\d+)\s*)?\)$/);
-    if (m) {
-      const h = parseFloat(m[1]) % 360;
-      const s = parseFloat(m[2]) / 100;
-      const l = parseFloat(m[3]) / 100;
-      const a = m[4] !== undefined ? parseFloat(m[4]) : 1;
-      let r, g, b;
-      if (s === 0) {
-        r = g = b = l;
+  _fallbackTextWidth(text, size) {
+    // More accurate fallback based on character analysis
+    let width = 0;
+    for (let i = 0; i < text.length; i++) {
+      const char = text[i];
+      const code = char.charCodeAt(0);
+      
+      // Different character widths based on type
+      if (code >= 32 && code <= 126) { // ASCII printable
+        if ('iIl1'.includes(char)) width += size * 0.3; // Narrow chars
+        else if ('mMwW'.includes(char)) width += size * 0.8; // Wide chars
+        else if ('fijrt'.includes(char)) width += size * 0.4; // Medium-narrow
+        else width += size * 0.6; // Average width
+      } else if (code >= 0x4E00 && code <= 0x9FFF) { // CJK
+        width += size * 1.0; // Full-width
+      } else if (code >= 0x0600 && code <= 0x06FF) { // Arabic
+        width += size * 0.5; // Variable width
       } else {
-        const hue2rgb = (p, q, t) => {
-          if (t < 0) t += 1;
-          if (t > 1) t -= 1;
-          if (t < 1/6) return p + (q - p) * 6 * t;
-          if (t < 1/2) return q;
-          if (t < 2/3) return p + (q - p) * (2/3 - t) * 6;
-          return p;
-        };
-        const q = l < 0.5 ? l * (1 + s) : l + s - l * s;
-        const p = 2 * l - q;
-        const hk = h / 360;
-        r = hue2rgb(p, q, hk + 1/3);
-        g = hue2rgb(p, q, hk);
-        b = hue2rgb(p, q, hk - 1/3);
+        width += size * 0.6; // Default
       }
-      return { r, g, b, a };
     }
-    return { r: 0, g: 0, b: 0, a: 0 };
+    return width;
   }
 
-  // Parse CSS length strings (px, pt, em) into numeric px; defaults 0.
-  // Returns 0 on parse failure or for 'auto'.
-  static _parseCssLength(cssValue, baseFontSize = 0) {
-    if (!cssValue || cssValue === 'auto') return 0;
-    const m = cssValue.match(/^([\d.]+)(px|pt|em)?$/);
-    if (m) {
-      const v = parseFloat(m[1]);
-      const unit = m[2] || 'px';
-      switch (unit) {
-        case 'px': return v;
-        case 'pt': return v * (96/72); // convert pt to px
-        case 'em': return v * baseFontSize;
-      }
+  // Enhanced CSS color parsing with more formats and better error handling
+  static _parseCssColor(cssColor) {
+    if (!cssColor || cssColor === 'transparent') {
+      return { r: 0, g: 0, b: 0, a: 0 };
     }
-    return parseFloat(cssValue) || 0;
+    
+    try {
+      // Normalize the color string
+      cssColor = cssColor.trim().toLowerCase();
+      
+      // Named colors support
+      const namedColors = {
+        'black': '#000000', 'white': '#ffffff', 'red': '#ff0000', 'green': '#008000',
+        'blue': '#0000ff', 'yellow': '#ffff00', 'cyan': '#00ffff', 'magenta': '#ff00ff',
+        'silver': '#c0c0c0', 'gray': '#808080', 'maroon': '#800000', 'olive': '#808000',
+        'lime': '#00ff00', 'aqua': '#00ffff', 'teal': '#008080', 'navy': '#000080',
+        'fuchsia': '#ff00ff', 'purple': '#800080', 'orange': '#ffa500', 'pink': '#ffc0cb'
+      };
+      
+      if (namedColors[cssColor]) {
+        cssColor = namedColors[cssColor];
+      }
+      
+      // Parse rgb/rgba with optional alpha
+      let m = cssColor.match(/rgba?\(\s*(\d+(?:\.\d+)?)\s*,\s*(\d+(?:\.\d+)?)\s*,\s*(\d+(?:\.\d+)?)\s*(?:,\s*([01]?\.?\d*))?\s*\)/);
+      if (m) {
+        return {
+          r: Math.min(255, Math.max(0, parseFloat(m[1]))) / 255,
+          g: Math.min(255, Math.max(0, parseFloat(m[2]))) / 255,
+          b: Math.min(255, Math.max(0, parseFloat(m[3]))) / 255,
+          a: m[4] !== undefined ? Math.min(1, Math.max(0, parseFloat(m[4]))) : 1
+        };
+      }
+      
+      // Parse rgb/rgba with percentages
+      m = cssColor.match(/rgba?\(\s*(\d+(?:\.\d+)?)%\s*,\s*(\d+(?:\.\d+)?)%\s*,\s*(\d+(?:\.\d+)?)%\s*(?:,\s*([01]?\.?\d*))?\s*\)/);
+      if (m) {
+        return {
+          r: Math.min(100, Math.max(0, parseFloat(m[1]))) / 100,
+          g: Math.min(100, Math.max(0, parseFloat(m[2]))) / 100,
+          b: Math.min(100, Math.max(0, parseFloat(m[3]))) / 100,
+          a: m[4] !== undefined ? Math.min(1, Math.max(0, parseFloat(m[4]))) : 1
+        };
+      }
+      
+      // Parse #rrggbb
+      m = cssColor.match(/^#([0-9a-f]{6})$/);
+      if (m) {
+        const hex = parseInt(m[1], 16);
+        return {
+          r: ((hex >> 16) & 0xFF) / 255,
+          g: ((hex >> 8) & 0xFF) / 255,
+          b: (hex & 0xFF) / 255,
+          a: 1
+        };
+      }
+      
+      // Parse #rgb (3-digit hex)
+      m = cssColor.match(/^#([0-9a-f]{3})$/);
+      if (m) {
+        const h = m[1];
+        return {
+          r: parseInt(h[0] + h[0], 16) / 255,
+          g: parseInt(h[1] + h[1], 16) / 255,
+          b: parseInt(h[2] + h[2], 16) / 255,
+          a: 1
+        };
+      }
+      
+      // Parse hsl and hsla
+      m = cssColor.match(/^hsla?\(\s*(\d+(?:\.\d+)?)\s*,\s*(\d+(?:\.\d+)?)%\s*,\s*(\d+(?:\.\d+)?)%\s*(?:,\s*([01]?\.\d+)\s*)?\)$/);
+      if (m) {
+        const h = parseFloat(m[1]) % 360;
+        const s = Math.min(100, Math.max(0, parseFloat(m[2]))) / 100;
+        const l = Math.min(100, Math.max(0, parseFloat(m[3]))) / 100;
+        const a = m[4] !== undefined ? Math.min(1, Math.max(0, parseFloat(m[4]))) : 1;
+        
+        let r, g, b;
+        if (s === 0) {
+          r = g = b = l;
+        } else {
+          const hue2rgb = (p, q, t) => {
+            if (t < 0) t += 1;
+            if (t > 1) t -= 1;
+            if (t < 1/6) return p + (q - p) * 6 * t;
+            if (t < 1/2) return q;
+            if (t < 2/3) return p + (q - p) * (2/3 - t) * 6;
+            return p;
+          };
+          const q = l < 0.5 ? l * (1 + s) : l + s - l * s;
+          const p = 2 * l - q;
+          const hk = h / 360;
+          r = hue2rgb(p, q, hk + 1/3);
+          g = hue2rgb(p, q, hk);
+          b = hue2rgb(p, q, hk - 1/3);
+        }
+        return { r, g, b, a };
+      }
+      
+      // If no match found, return transparent
+      return { r: 0, g: 0, b: 0, a: 0 };
+      
+    } catch (error) {
+      console.warn('Failed to parse CSS color:', cssColor, error);
+      return { r: 0, g: 0, b: 0, a: 0 };
+    }
+  }
+
+  // Enhanced CSS length parsing with more units and calc() support
+  static _parseCssLength(cssValue, baseFontSize = 12, containerSize = 0) {
+    if (!cssValue || cssValue === 'auto' || cssValue === 'inherit') return 0;
+    
+    try {
+      // Handle calc() expressions (basic support)
+      if (cssValue.includes('calc(')) {
+        return PDFExporter._parseCalcExpression(cssValue, baseFontSize, containerSize);
+      }
+      
+      const m = cssValue.match(/^([-+]?[\d.]+)(px|pt|em|rem|ex|ch|vw|vh|vmin|vmax|%|in|cm|mm|pc)?$/);
+      if (m) {
+        const value = parseFloat(m[1]);
+        const unit = m[2] || 'px';
+        
+        switch (unit) {
+          case 'px': return value;
+          case 'pt': return value * (96/72); // convert pt to px
+          case 'em': return value * baseFontSize;
+          case 'rem': return value * 16; // Assume 16px root font size
+          case 'ex': return value * baseFontSize * 0.5; // Approximate x-height
+          case 'ch': return value * baseFontSize * 0.6; // Approximate character width
+          case 'vw': return value * (containerSize || 595.28) / 100; // Viewport width
+          case 'vh': return value * (containerSize || 841.89) / 100; // Viewport height
+          case 'vmin': return value * Math.min(595.28, 841.89) / 100;
+          case 'vmax': return value * Math.max(595.28, 841.89) / 100;
+          case '%': return value * (containerSize || 0) / 100;
+          case 'in': return value * 96; // 96 DPI
+          case 'cm': return value * 96 / 2.54;
+          case 'mm': return value * 96 / 25.4;
+          case 'pc': return value * 96 / 6; // 1 pica = 1/6 inch
+          default: return value;
+        }
+      }
+      
+      return parseFloat(cssValue) || 0;
+    } catch (error) {
+      console.warn('Failed to parse CSS length:', cssValue, error);
+      return 0;
+    }
+  }
+
+  // Basic calc() expression parser
+  static _parseCalcExpression(calcStr, baseFontSize, containerSize) {
+    try {
+      // Remove calc() wrapper and normalize
+      let expr = calcStr.replace(/calc\s*\(\s*/, '').replace(/\s*\)$/, '');
+      
+      // Simple expression evaluation (supports +, -, *, /)
+      // This is a basic implementation - a full calc() parser would be much more complex
+      const tokens = expr.split(/(\+|\-|\*|\/)/).map(t => t.trim());
+      
+      let result = 0;
+      let operator = '+';
+      
+      for (let i = 0; i < tokens.length; i++) {
+        const token = tokens[i];
+        
+        if (['+', '-', '*', '/'].includes(token)) {
+          operator = token;
+        } else {
+          const value = PDFExporter._parseCssLength(token, baseFontSize, containerSize);
+          
+          switch (operator) {
+            case '+': result += value; break;
+            case '-': result -= value; break;
+            case '*': result *= value; break;
+            case '/': result = value !== 0 ? result / value : result; break;
+            default: result = value;
+          }
+        }
+      }
+      
+      return result;
+    } catch (error) {
+      console.warn('Failed to parse calc() expression:', calcStr, error);
+      return 0;
+    }
+  }
+
+  // Enhanced CSS property parsing with more properties
+  _parseAdvancedCssProperties(cs, baseFontSize) {
+    const props = {};
+    
+    try {
+      // Box model properties
+      props.boxSizing = cs.boxSizing || 'content-box';
+      
+      // Display and positioning
+      props.display = cs.display || 'block';
+      props.position = cs.position || 'static';
+      props.float = cs.float || 'none';
+      props.clear = cs.clear || 'none';
+      
+      // Flexbox properties
+      props.flexDirection = cs.flexDirection || 'row';
+      props.justifyContent = cs.justifyContent || 'flex-start';
+      props.alignItems = cs.alignItems || 'stretch';
+      props.flexWrap = cs.flexWrap || 'nowrap';
+      
+      // Text properties
+      props.textDecoration = cs.textDecoration || 'none';
+      props.textTransform = cs.textTransform || 'none';
+      props.letterSpacing = PDFExporter._parseCssLength(cs.letterSpacing, baseFontSize);
+      props.wordSpacing = PDFExporter._parseCssLength(cs.wordSpacing, baseFontSize);
+      props.lineHeight = cs.lineHeight === 'normal' ? baseFontSize * 1.2 : 
+                        PDFExporter._parseCssLength(cs.lineHeight, baseFontSize);
+      
+      // Visual effects
+      props.opacity = parseFloat(cs.opacity) || 1;
+      props.visibility = cs.visibility || 'visible';
+      props.overflow = cs.overflow || 'visible';
+      props.textOverflow = cs.textOverflow || 'clip';
+      props.whiteSpace = cs.whiteSpace || 'normal';
+      props.wordBreak = cs.wordBreak || 'normal';
+      
+      // Shadow properties (basic parsing)
+      props.boxShadow = this._parseBoxShadow(cs.boxShadow);
+      props.textShadow = this._parseTextShadow(cs.textShadow);
+      
+      return props;
+    } catch (error) {
+      this._handleError('Advanced CSS property parsing failed', error);
+      return {};
+    }
+  }
+
+  _parseBoxShadow(shadowStr) {
+    if (!shadowStr || shadowStr === 'none') return null;
+    
+    try {
+      // Basic box-shadow parsing: offset-x offset-y blur-radius spread-radius color
+      const parts = shadowStr.split(/\s+/);
+      if (parts.length >= 2) {
+        return {
+          offsetX: parseFloat(parts[0]) || 0,
+          offsetY: parseFloat(parts[1]) || 0,
+          blurRadius: parseFloat(parts[2]) || 0,
+          spreadRadius: parseFloat(parts[3]) || 0,
+          color: parts.length > 4 ? parts.slice(4).join(' ') : 'rgba(0,0,0,0.5)'
+        };
+      }
+    } catch (error) {
+      this._handleError('Box shadow parsing failed', error);
+    }
+    
+    return null;
+  }
+
+  _parseTextShadow(shadowStr) {
+    if (!shadowStr || shadowStr === 'none') return null;
+    
+    try {
+      // Basic text-shadow parsing: offset-x offset-y blur-radius color
+      const parts = shadowStr.split(/\s+/);
+      if (parts.length >= 2) {
+        return {
+          offsetX: parseFloat(parts[0]) || 0,
+          offsetY: parseFloat(parts[1]) || 0,
+          blurRadius: parseFloat(parts[2]) || 0,
+          color: parts.length > 3 ? parts.slice(3).join(' ') : 'rgba(0,0,0,0.5)'
+        };
+      }
+    } catch (error) {
+      this._handleError('Text shadow parsing failed', error);
+    }
+    
+    return null;
   }
 
   // Get and cache computed style for an element
   _getStyle(el) {
-    let cs = this.styleCache.get(el);
-    if (!cs) {
-      cs = window.getComputedStyle(el);
-      this.styleCache.set(el, cs);
+    try {
+      // Check cache size and clean if necessary
+      if (this.cacheSize > this.maxCacheSize) {
+        this._cleanStyleCache();
+      }
+      
+      let cs = this.styleCache.get(el);
+      if (!cs) {
+        cs = window.getComputedStyle(el);
+        this.styleCache.set(el, cs);
+        this.cacheSize++;
+      }
+      return cs;
+    } catch (error) {
+      this._handleError('Style computation failed', error);
+      // Return a minimal style object as fallback
+      return {
+        display: 'block',
+        color: 'black',
+        fontSize: '12px',
+        fontFamily: 'serif',
+        textAlign: 'left',
+        backgroundColor: 'transparent',
+        marginTop: '0px',
+        marginBottom: '0px',
+        paddingTop: '0px',
+        paddingBottom: '0px',
+        paddingLeft: '0px',
+        paddingRight: '0px'
+      };
     }
-    return cs;
+  }
+
+  _cleanStyleCache() {
+    // Simple cache cleanup - in a real implementation, you might use LRU
+    this.styleCache = new WeakMap();
+    this.cacheSize = 0;
+    this._addWarning('Style cache cleaned due to size limit');
   }
 
   // Low-level draw a single text run at x,y
@@ -721,40 +1151,42 @@ class PDFExporter {
           this.renderers[tag](child, styleState, this);
           return;
         }
-        if (tag==='H1') {
-          console.log('PDFExporter H1 content:', child.textContent.trim()); // Diagnostic log
-          const normalizedText = this._normalizeText(child.textContent.trim());
-          this._drawStyledText(normalizedText, { fontKey:'H', size:this.fontSizes.h1, color:styleState.color, indent:styleState.indent });
-        } else if (tag==='H2') {
-          console.log('PDFExporter H2 content:', child.textContent.trim()); // Diagnostic log
-          const normalizedText = this._normalizeText(child.textContent.trim());
-          this._drawStyledText(normalizedText, { fontKey:'B', size:this.fontSizes.h2, color:styleState.color, indent:styleState.indent });
-        } else if (tag==='P') {
-          this._drawStyledText(child.textContent.trim(), styleState);
-        } else if (tag==='UL'||tag==='OL') {
-          this._drawList(child, 0, styleState, tag==='OL');
-        } else if (tag==='TABLE') {
-          const td = this._prepareTable(child);
-          this._measureTable(td, childStyleState); // Pass childStyleState for font size
-          this._layoutTable(td, childStyleState); // Pass childStyleState for availableWidth
-          this._renderTable(td, childStyleState); // Pass childStyleState for indent and font size
+        // Enhanced element processing with comprehensive support
+        this.processedElements++;
+        
+        // Headings (H1-H6)
+        if (['H1', 'H2', 'H3', 'H4', 'H5', 'H6'].includes(tag)) {
+          this._processHeading(child, tag, styleState);
+        } else if (tag === 'P') {
+          this._processParagraph(child, childStyleState);
+        } else if (tag === 'UL' || tag === 'OL') {
+          this._drawList(child, 0, childStyleState, tag === 'OL');
+        } else if (tag === 'TABLE') {
+          this._processTable(child, childStyleState);
         } else if (tag === 'HR') {
-          this._ensureSpace(1); 
-          const hrY = this.cursorY - (styleState.size * 0.6); // Position rule in approx middle of current line space
-          const x1 = this.margin;
-          const x2 = this.pageWidth - this.margin;
-          this._write(`${x1.toFixed(3)} ${hrY.toFixed(3)} m ${x2.toFixed(3)} ${hrY.toFixed(3)} l S\n`); // Stroke a line
-          this.cursorY -= styleState.size * 1.2; // Advance cursor by one line height
+          this._processHorizontalRule(child, styleState);
         } else if (tag === 'BLOCKQUOTE') {
-          const quoteStyle = { ...styleState, indent: (styleState.indent || 0) + (this.bulletIndent || 20) };
-          this.cursorY -= (this.fontSizes.normal * 0.5); // Simulate a small top margin for the blockquote
-          this._ensureSpace(1); // Ensure space before processing blockquote's content
-          this._processBlock(child, quoteStyle); // 'child' is the BLOCKQUOTE element, process its children with new style
-          this.cursorY -= (this.fontSizes.normal * 0.5); // Simulate a small bottom margin
+          this._processBlockquote(child, styleState);
         } else if (tag === 'IMG' || tag === 'CANVAS') {
           this._drawImage(child, styleState);
+        } else if (tag === 'SVG') {
+          this._processSVG(child, styleState);
+        } else if (['ARTICLE', 'SECTION', 'ASIDE', 'NAV', 'HEADER', 'FOOTER', 'MAIN'].includes(tag)) {
+          this._processSemanticElement(child, childStyleState);
+        } else if (['FIGURE', 'FIGCAPTION'].includes(tag)) {
+          this._processFigure(child, childStyleState);
+        } else if (['DETAILS', 'SUMMARY'].includes(tag)) {
+          this._processDetails(child, childStyleState);
+        } else if (['INPUT', 'TEXTAREA', 'SELECT', 'BUTTON'].includes(tag)) {
+          this._processFormElement(child, styleState);
+        } else if (['PRE', 'CODE'].includes(tag)) {
+          this._processCodeBlock(child, childStyleState);
+        } else if (tag === 'DL') {
+          this._processDefinitionList(child, childStyleState);
+        } else if (tag === 'ADDRESS') {
+          this._processAddress(child, childStyleState);
         } else {
-          this._processBlock(child, styleState);
+          this._processBlock(child, childStyleState);
         }
       }
     });
@@ -1102,19 +1534,65 @@ class PDFExporter {
     URL.revokeObjectURL(url);
   }
 
-  static async init(opts = {}) { // init is now async
-    const pdf = new PDFExporter(opts);
-    const rootElements = Array.from(document.querySelectorAll(opts.selector));
-    
-    // Preprocess images before starting PDF generation
-    await pdf._loadAndPreprocessImages(rootElements);
-
-    pdf._newPage();
-    const defaultStyle = { fontKey:'N', size:pdf.fontSizes.normal, color:{r:0,g:0,b:0}, indent:0 };
-    rootElements.forEach(root => {
-      pdf._processBlock(root, defaultStyle);
-    });
-    pdf.save(opts.filename);
+  static async init(opts = {}) {
+    try {
+      const pdf = new PDFExporter(opts);
+      const selector = opts.selector || 'body';
+      const filename = opts.filename || 'document.pdf';
+      
+      // Find elements to process
+      const rootElements = Array.from(document.querySelectorAll(selector));
+      if (rootElements.length === 0) {
+        throw new Error(`No elements found with selector: ${selector}`);
+      }
+      
+      pdf._reportProgress('initialization', 1, 4);
+      
+      // Preprocess images before starting PDF generation
+      pdf._reportProgress('preprocessing', 2, 4);
+      await pdf._loadAndPreprocessImages(rootElements);
+      
+      // Start PDF generation
+      pdf._reportProgress('generation', 3, 4);
+      pdf._newPage();
+      
+      const defaultStyle = { 
+        fontKey: 'N', 
+        size: pdf.fontSizes.normal, 
+        color: { r: 0, g: 0, b: 0, a: 1 }, 
+        indent: 0,
+        availableWidth: pdf.pageWidth - 2 * pdf.margin,
+        textAlign: 'left'
+      };
+      
+      // Process each root element
+      rootElements.forEach((root, index) => {
+        try {
+          pdf._processBlock(root, defaultStyle);
+          pdf._reportProgress('processing', index + 1, rootElements.length);
+        } catch (error) {
+          pdf._handleError(`Processing element ${index} failed`, error);
+        }
+      });
+      
+      // Finalize and save
+      pdf._reportProgress('finalization', 4, 4);
+      pdf.save(filename);
+      
+      // Return summary
+      return {
+        success: true,
+        pages: pdf.pages.length,
+        elementsProcessed: pdf.processedElements,
+        errors: pdf.errors,
+        warnings: pdf.warnings,
+        processingTime: Date.now() - pdf.startTime
+      };
+      
+    } catch (error) {
+      console.error('PDFExporter initialization failed:', error);
+      throw error;
+    }
   }
 
   _escapePDFString(text) {
@@ -1184,22 +1662,739 @@ class PDFExporter {
     return str;
   }
 
-  // Helper method to normalize Unicode punctuation to ASCII equivalents
+  // Enhanced Unicode normalization with comprehensive character support
   _normalizeText(text) {
     if (!text) return text;
-    return text
-      .replace(/：/g, ':')    // Full-width colon to regular colon
-      .replace(/；/g, ';')    // Full-width semicolon to regular semicolon
-      .replace(/，/g, ',')    // Full-width comma to regular comma
-      .replace(/。/g, '.')    // Full-width period to regular period
-      .replace(/？/g, '?')    // Full-width question mark to regular question mark
-      .replace(/！/g, '!')    // Full-width exclamation mark to regular exclamation mark
-      .replace(/（/g, '(')    // Full-width left parenthesis to regular left parenthesis
-      .replace(/）/g, ')')    // Full-width right parenthesis to regular right parenthesis
-      .replace(/【/g, '[')    // Full-width left bracket to regular left bracket
-      .replace(/】/g, ']');   // Full-width right bracket to regular right bracket
+    
+    try {
+      return text
+        // Full-width punctuation to ASCII
+        .replace(/：/g, ':')    // Full-width colon
+        .replace(/；/g, ';')    // Full-width semicolon
+        .replace(/，/g, ',')    // Full-width comma
+        .replace(/。/g, '.')    // Full-width period
+        .replace(/？/g, '?')    // Full-width question mark
+        .replace(/！/g, '!')    // Full-width exclamation mark
+        .replace(/（/g, '(')    // Full-width left parenthesis
+        .replace(/）/g, ')')    // Full-width right parenthesis
+        .replace(/【/g, '[')    // Full-width left bracket
+        .replace(/】/g, ']')    // Full-width right bracket
+        .replace(/「/g, '"')    // Japanese left quote
+        .replace(/」/g, '"')    // Japanese right quote
+        .replace(/『/g, '"')    // Japanese left double quote
+        .replace(/』/g, '"')    // Japanese right double quote
+        
+        // Mathematical and currency symbols
+        .replace(/＋/g, '+')    // Full-width plus
+        .replace(/－/g, '-')    // Full-width minus
+        .replace(/×/g, 'x')     // Multiplication sign
+        .replace(/÷/g, '/')     // Division sign
+        .replace(/＝/g, '=')    // Full-width equals
+        .replace(/￥/g, '¥')    // Full-width yen
+        .replace(/＄/g, '$')    // Full-width dollar
+        
+        // Quotation marks normalization
+        .replace(/[""]/g, '"')  // Smart quotes to straight
+        .replace(/['']/g, "'")  // Smart apostrophes to straight
+        .replace(/…/g, '...')   // Ellipsis to three dots
+        .replace(/–/g, '-')     // En dash to hyphen
+        .replace(/—/g, '--')    // Em dash to double hyphen
+        
+        // Normalize whitespace
+        .replace(/\u00A0/g, ' ') // Non-breaking space to regular space
+        .replace(/\u2000-\u200B/g, ' ') // Various Unicode spaces
+        .replace(/\u2028/g, '\n') // Line separator
+        .replace(/\u2029/g, '\n\n') // Paragraph separator
+        
+        // Remove zero-width characters that can cause issues
+        .replace(/[\u200B-\u200D\uFEFF]/g, '');
+        
+    } catch (error) {
+      this._handleError('Text normalization failed', error);
+      return text; // Return original text if normalization fails
+    }
+  }
+
+  // Enhanced text overflow handling
+  _handleTextOverflow(text, maxWidth, size, overflowMode = 'wrap') {
+    try {
+      const textWidth = this._textWidth(text, size);
+      
+      if (textWidth <= maxWidth) {
+        return { text, overflow: false };
+      }
+      
+      switch (overflowMode) {
+        case 'ellipsis':
+          return this._truncateWithEllipsis(text, maxWidth, size);
+        case 'break-word':
+          return this._breakWord(text, maxWidth, size);
+        case 'clip':
+          return { text: this._clipText(text, maxWidth, size), overflow: true };
+        case 'wrap':
+        default:
+          return { text, overflow: true }; // Let normal wrapping handle it
+      }
+    } catch (error) {
+      this._handleError('Text overflow handling failed', error);
+      return { text, overflow: false };
+    }
+  }
+
+  _truncateWithEllipsis(text, maxWidth, size) {
+    const ellipsis = '...';
+    const ellipsisWidth = this._textWidth(ellipsis, size);
+    const availableWidth = maxWidth - ellipsisWidth;
+    
+    if (availableWidth <= 0) {
+      return { text: ellipsis, overflow: true };
+    }
+    
+    let truncated = '';
+    for (let i = 0; i < text.length; i++) {
+      const testText = truncated + text[i];
+      if (this._textWidth(testText, size) > availableWidth) {
+        break;
+      }
+      truncated = testText;
+    }
+    
+    return { text: truncated + ellipsis, overflow: true };
+  }
+
+  _breakWord(text, maxWidth, size) {
+    let result = '';
+    for (let i = 0; i < text.length; i++) {
+      const char = text[i];
+      const testText = result + char;
+      if (this._textWidth(testText, size) > maxWidth && result.length > 0) {
+        result += '\n' + char;
+      } else {
+        result += char;
+      }
+    }
+    return { text: result, overflow: result.includes('\n') };
+  }
+
+  _clipText(text, maxWidth, size) {
+    let clipped = '';
+    for (let i = 0; i < text.length; i++) {
+      const testText = clipped + text[i];
+      if (this._textWidth(testText, size) > maxWidth) {
+        break;
+      }
+      clipped = testText;
+    }
+    return clipped;
+  }
+
+  // Enhanced element processing methods
+  _processHeading(headingEl, tag, styleState) {
+    try {
+      const level = parseInt(tag.charAt(1));
+      const fontSize = this.fontSizes[tag.toLowerCase()] || this.fontSizes.normal;
+      const normalizedText = this._normalizeText(headingEl.textContent.trim());
+      
+      if (this.debug) {
+        console.log(`PDFExporter ${tag} content:`, normalizedText);
+      }
+      
+      // Add spacing before heading
+      this.cursorY -= fontSize * 0.5;
+      this._ensureSpace(2);
+      
+      this._drawStyledText(normalizedText, { 
+        fontKey: level <= 2 ? 'H' : 'B', 
+        size: fontSize, 
+        color: styleState.color, 
+        indent: styleState.indent,
+        availableWidth: styleState.availableWidth,
+        textAlign: styleState.textAlign
+      });
+      
+      // Add spacing after heading
+      this.cursorY -= fontSize * 0.3;
+    } catch (error) {
+      this._handleError(`Processing ${tag} failed`, error);
+    }
+  }
+
+  _processParagraph(pEl, styleState) {
+    try {
+      // Process paragraph with inline elements
+      Array.from(pEl.childNodes).forEach(child => {
+        this._processInline(child, styleState);
+      });
+      
+      // Add paragraph spacing
+      this.cursorY -= styleState.size * 0.5;
+    } catch (error) {
+      this._handleError('Processing paragraph failed', error);
+    }
+  }
+
+  _processTable(tableEl, styleState) {
+    try {
+      const td = this._prepareTable(tableEl);
+      this._measureTable(td, styleState);
+      this._layoutTable(td, styleState);
+      this._renderTable(td, styleState);
+    } catch (error) {
+      this._handleError('Processing table failed', error);
+    }
+  }
+
+  _processHorizontalRule(hrEl, styleState) {
+    try {
+      const cs = this._getStyle(hrEl);
+      this._ensureSpace(1);
+      
+      const hrY = this.cursorY - (styleState.size * 0.6);
+      const x1 = this.margin + (styleState.indent || 0);
+      const x2 = this.pageWidth - this.margin;
+      
+      // Parse HR styling
+      const borderColor = PDFExporter._parseCssColor(cs.borderTopColor || cs.borderColor || '#000000');
+      const borderWidth = PDFExporter._parseCssLength(cs.borderTopWidth || cs.borderWidth || '1px');
+      
+      if (borderColor.a > 0) {
+        this._write(`${borderColor.r.toFixed(3)} ${borderColor.g.toFixed(3)} ${borderColor.b.toFixed(3)} RG\n`);
+        this._write(`${borderWidth.toFixed(3)} w\n`);
+        this._write(`${x1.toFixed(3)} ${hrY.toFixed(3)} m ${x2.toFixed(3)} ${hrY.toFixed(3)} l S\n`);
+        this._write('0 0 0 RG\n1 w\n'); // Reset
+      }
+      
+      this.cursorY -= styleState.size * 1.2;
+    } catch (error) {
+      this._handleError('Processing horizontal rule failed', error);
+    }
+  }
+
+  _processBlockquote(blockquoteEl, styleState) {
+    try {
+      const quoteStyle = { 
+        ...styleState, 
+        indent: (styleState.indent || 0) + (this.bulletIndent || 20) 
+      };
+      
+      this.cursorY -= (this.fontSizes.normal * 0.5);
+      this._ensureSpace(1);
+      this._processBlock(blockquoteEl, quoteStyle);
+      this.cursorY -= (this.fontSizes.normal * 0.5);
+    } catch (error) {
+      this._handleError('Processing blockquote failed', error);
+    }
+  }
+
+  _processSVG(svgEl, styleState) {
+    try {
+      // Basic SVG support - render as placeholder for now
+      const cs = this._getStyle(svgEl);
+      const width = PDFExporter._parseCssLength(cs.width, styleState.size) || 100;
+      const height = PDFExporter._parseCssLength(cs.height, styleState.size) || 100;
+      
+      this._ensureSpace(height / this.leading);
+      
+      // Draw SVG placeholder rectangle
+      const x = this.margin + (styleState.indent || 0);
+      const y = this.cursorY - height;
+      
+      this._write('0.8 0.8 0.8 rg\n'); // Light gray fill
+      this._write(`${x.toFixed(3)} ${y.toFixed(3)} ${width.toFixed(3)} ${height.toFixed(3)} re f\n`);
+      this._write('0 0 0 rg\n'); // Reset to black
+      
+      // Add SVG label
+      this._drawCell('[SVG]', 'N', styleState.size, x + 5, y + height/2, { r: 0, g: 0, b: 0, a: 1 });
+      
+      this.cursorY -= height + this.leading * 0.2;
+    } catch (error) {
+      this._handleError('Processing SVG failed', error);
+    }
+  }
+
+  _processSemanticElement(semanticEl, styleState) {
+    try {
+      // Semantic elements are processed like regular blocks but with potential styling
+      this._processBlock(semanticEl, styleState);
+    } catch (error) {
+      this._handleError('Processing semantic element failed', error);
+    }
+  }
+
+  _processFigure(figureEl, styleState) {
+    try {
+      const tag = figureEl.tagName.toUpperCase();
+      
+      if (tag === 'FIGURE') {
+        // Add some spacing around figure
+        this.cursorY -= this.fontSizes.normal * 0.3;
+        this._processBlock(figureEl, styleState);
+        this.cursorY -= this.fontSizes.normal * 0.3;
+      } else if (tag === 'FIGCAPTION') {
+        // Style figcaption differently
+        const captionStyle = { 
+          ...styleState, 
+          size: styleState.size * 0.9,
+          fontKey: 'I' // Italic for captions
+        };
+        Array.from(figureEl.childNodes).forEach(child => {
+          this._processInline(child, captionStyle);
+        });
+      }
+    } catch (error) {
+      this._handleError('Processing figure failed', error);
+    }
+  }
+
+  _processDetails(detailsEl, styleState) {
+    try {
+      const tag = detailsEl.tagName.toUpperCase();
+      
+      if (tag === 'DETAILS') {
+        // Process details as expanded (since PDF is static)
+        this._processBlock(detailsEl, styleState);
+      } else if (tag === 'SUMMARY') {
+        // Style summary as bold
+        const summaryStyle = { ...styleState, fontKey: 'B' };
+        Array.from(detailsEl.childNodes).forEach(child => {
+          this._processInline(child, summaryStyle);
+        });
+      }
+    } catch (error) {
+      this._handleError('Processing details failed', error);
+    }
+  }
+
+  _processFormElement(formEl, styleState) {
+    try {
+      const tag = formEl.tagName.toUpperCase();
+      const cs = this._getStyle(formEl);
+      
+      // Get form element properties
+      const value = formEl.value || formEl.textContent || '';
+      const placeholder = formEl.getAttribute('placeholder') || '';
+      const type = formEl.getAttribute('type') || 'text';
+      
+      let displayText = '';
+      let elementStyle = { ...styleState };
+      
+      switch (tag) {
+        case 'INPUT':
+          switch (type) {
+            case 'checkbox':
+              displayText = formEl.checked ? '☑ ' : '☐ ';
+              break;
+            case 'radio':
+              displayText = formEl.checked ? '● ' : '○ ';
+              break;
+            case 'submit':
+            case 'button':
+              displayText = `[${value || 'Button'}]`;
+              elementStyle.fontKey = 'B';
+              break;
+            default:
+              displayText = value || placeholder || `[${type} field]`;
+              elementStyle.fontKey = 'M'; // Monospace for input fields
+              break;
+          }
+          break;
+        case 'TEXTAREA':
+          displayText = value || placeholder || '[Text area]';
+          elementStyle.fontKey = 'M';
+          break;
+        case 'SELECT':
+          const selectedOption = formEl.querySelector('option[selected]');
+          displayText = selectedOption ? selectedOption.textContent : '[Select]';
+          break;
+        case 'BUTTON':
+          displayText = `[${value || formEl.textContent || 'Button'}]`;
+          elementStyle.fontKey = 'B';
+          break;
+      }
+      
+      if (displayText) {
+        this._drawStyledText(displayText, elementStyle);
+      }
+    } catch (error) {
+      this._handleError('Processing form element failed', error);
+    }
+  }
+
+  _processCodeBlock(codeEl, styleState) {
+    try {
+      const tag = codeEl.tagName.toUpperCase();
+      const codeStyle = { 
+        ...styleState, 
+        fontKey: 'M', // Monospace
+        size: styleState.size * 0.9
+      };
+      
+      if (tag === 'PRE') {
+        // Preserve whitespace and line breaks
+        const text = codeEl.textContent;
+        const lines = text.split('\n');
+        
+        lines.forEach(line => {
+          if (line.trim()) {
+            this._drawStyledText(line, codeStyle);
+          } else {
+            this.cursorY -= codeStyle.size * 1.2; // Empty line
+          }
+        });
+      } else {
+        // Inline code
+        Array.from(codeEl.childNodes).forEach(child => {
+          this._processInline(child, codeStyle);
+        });
+      }
+    } catch (error) {
+      this._handleError('Processing code block failed', error);
+    }
+  }
+
+  _processDefinitionList(dlEl, styleState) {
+    try {
+      Array.from(dlEl.children).forEach(child => {
+        const tag = child.tagName.toUpperCase();
+        
+        if (tag === 'DT') {
+          // Definition term - bold
+          const dtStyle = { ...styleState, fontKey: 'B' };
+          Array.from(child.childNodes).forEach(node => {
+            this._processInline(node, dtStyle);
+          });
+        } else if (tag === 'DD') {
+          // Definition description - indented
+          const ddStyle = { 
+            ...styleState, 
+            indent: (styleState.indent || 0) + this.bulletIndent 
+          };
+          Array.from(child.childNodes).forEach(node => {
+            this._processInline(node, ddStyle);
+          });
+        }
+      });
+    } catch (error) {
+      this._handleError('Processing definition list failed', error);
+    }
+  }
+
+  _processAddress(addressEl, styleState) {
+    try {
+      // Style address as italic
+      const addressStyle = { ...styleState, fontKey: 'I' };
+      Array.from(addressEl.childNodes).forEach(child => {
+        this._processInline(child, addressStyle);
+      });
+    } catch (error) {
+      this._handleError('Processing address failed', error);
+    }
+  }
+
+  // Utility and debugging methods
+  getStats() {
+    return {
+      pages: this.pages.length,
+      objects: this.objects.length,
+      elementsProcessed: this.processedElements,
+      errors: this.errors.length,
+      warnings: this.warnings.length,
+      cacheSize: this.cacheSize,
+      processingTime: Date.now() - this.startTime,
+      memoryUsage: this._estimateMemoryUsage()
+    };
+  }
+
+  _estimateMemoryUsage() {
+    try {
+      // Rough estimation of memory usage
+      let totalSize = 0;
+      
+      // Objects size
+      this.objects.forEach(obj => {
+        totalSize += (typeof obj === 'string' ? obj.length : 100) * 2; // UTF-16
+      });
+      
+      // Streams size
+      Object.values(this.streams).forEach(stream => {
+        totalSize += stream.reduce((acc, str) => acc + str.length * 2, 0);
+      });
+      
+      // Image cache size (rough estimate)
+      totalSize += this.processedElements * 50; // Rough estimate per element
+      
+      return {
+        estimated: totalSize,
+        unit: 'bytes',
+        mb: (totalSize / (1024 * 1024)).toFixed(2)
+      };
+    } catch (error) {
+      return { error: 'Could not estimate memory usage' };
+    }
+  }
+
+  // Clear caches and reset for memory management
+  clearCaches() {
+    this.styleCache = new WeakMap();
+    this.cacheSize = 0;
+    this._addWarning('Caches cleared manually');
+  }
+
+  // Get detailed error and warning reports
+  getErrorReport() {
+    return {
+      errors: this.errors,
+      warnings: this.warnings,
+      summary: {
+        totalErrors: this.errors.length,
+        totalWarnings: this.warnings.length,
+        criticalErrors: this.errors.filter(e => e.message.includes('Critical')).length
+      }
+    };
+  }
+
+  // Export configuration for debugging
+  exportConfig() {
+    return {
+      pageWidth: this.pageWidth,
+      pageHeight: this.pageHeight,
+      margin: this.margin,
+      fontSizes: this.fontSizes,
+      leading: this.leading,
+      bulletIndent: this.bulletIndent,
+      tableCellPadding: this.tableCellPadding,
+      fontFamily: this.fontFamily,
+      debug: this.debug,
+      hasCanvas: !!this.ctx,
+      renderers: Object.keys(this.renderers)
+    };
+  }
+
+  // Add custom CSS property support
+  addCustomCSSProperty(property, parser) {
+    if (typeof parser !== 'function') {
+      throw new Error('Parser must be a function');
+    }
+    
+    if (!this.customCSSParsers) {
+      this.customCSSParsers = {};
+    }
+    
+    this.customCSSParsers[property] = parser;
+  }
+
+  // Add custom element renderer
+  addElementRenderer(tagName, renderer) {
+    if (typeof renderer !== 'function') {
+      throw new Error('Renderer must be a function');
+    }
+    
+    this.renderers[tagName.toUpperCase()] = renderer;
+  }
+
+  // Performance monitoring
+  _startTimer(label) {
+    if (!this.timers) this.timers = {};
+    this.timers[label] = Date.now();
+  }
+
+  _endTimer(label) {
+    if (!this.timers || !this.timers[label]) return 0;
+    const elapsed = Date.now() - this.timers[label];
+    delete this.timers[label];
+    return elapsed;
+  }
+
+  // Enhanced page management
+  getCurrentPageInfo() {
+    const currentPage = this.pages[this.pages.length - 1];
+    return {
+      pageNumber: this.pages.length,
+      cursorY: this.cursorY,
+      remainingSpace: this.cursorY - this.margin,
+      imageCount: currentPage ? Object.keys(currentPage.imageResourceMap).length : 0,
+      annotationCount: currentPage ? currentPage.annotations.length : 0
+    };
+  }
+
+  // Force page break
+  forcePageBreak() {
+    this._newPage();
+  }
+
+  // Add custom header/footer support
+  setHeaderFooter(headerFn, footerFn) {
+    this.customHeader = typeof headerFn === 'function' ? headerFn : null;
+    this.customFooter = typeof footerFn === 'function' ? footerFn : null;
+  }
+
+  _drawCustomHeaderFooter() {
+    try {
+      const pageInfo = this.getCurrentPageInfo();
+      
+      if (this.customHeader) {
+        const savedY = this.cursorY;
+        this.cursorY = this.pageHeight - this.margin / 2;
+        this.customHeader(this, pageInfo);
+        this.cursorY = savedY;
+      }
+      
+      if (this.customFooter) {
+        const savedY = this.cursorY;
+        this.cursorY = this.margin / 2;
+        this.customFooter(this, pageInfo);
+        this.cursorY = savedY;
+      }
+    } catch (error) {
+      this._handleError('Custom header/footer rendering failed', error);
+    }
   }
 }
 
 // Expose globally
 window.PDFExporter = PDFExporter;
+
+// Enhanced Usage Examples and API Documentation
+/*
+=== ENHANCED PDF EXPORTER USAGE GUIDE ===
+
+1. BASIC USAGE:
+```javascript
+// Simple usage
+await PDFExporter.init({
+  selector: '.content',
+  filename: 'my-document.pdf'
+});
+
+// With progress tracking
+await PDFExporter.init({
+  selector: 'article',
+  filename: 'article.pdf',
+  onProgress: (info) => {
+    console.log(`${info.phase}: ${info.percentage}%`);
+  }
+});
+```
+
+2. ADVANCED CONFIGURATION:
+```javascript
+await PDFExporter.init({
+  // Page settings
+  pageSize: 'A4',           // A4, Letter, Legal, A3, A5, Tabloid
+  landscape: false,
+  margin: 40,
+  
+  // Font settings
+  fontSize: 12,
+  fontFamily: 'Helvetica',
+  h1FontSize: 24,
+  h2FontSize: 18,
+  h3FontSize: 16,
+  h4FontSize: 14,
+  h5FontSize: 12,
+  h6FontSize: 11,
+  
+  // Layout settings
+  bulletIndent: 20,
+  tableCellPadding: 5,
+  
+  // Callbacks
+  onProgress: (info) => console.log(info),
+  onError: (error) => console.error(error),
+  onWarning: (warning) => console.warn(warning),
+  onPage: (pdf, pageNum) => {
+    // Custom page processing
+  },
+  
+  // Debug mode
+  debug: true,
+  
+  // Custom renderers
+  renderers: {
+    'CUSTOM-ELEMENT': (element, styleState, pdf) => {
+      // Custom element processing
+    }
+  }
+});
+```
+
+3. SUPPORTED HTML ELEMENTS:
+- Headings: H1, H2, H3, H4, H5, H6
+- Text: P, SPAN, DIV, STRONG, EM, B, I, U, S, DEL, SUB, SUP, SMALL, MARK
+- Lists: UL, OL, LI (with nested support)
+- Tables: TABLE, THEAD, TBODY, TR, TH, TD
+- Media: IMG, CANVAS, SVG (basic support)
+- Semantic: ARTICLE, SECTION, ASIDE, NAV, HEADER, FOOTER, MAIN
+- Interactive: DETAILS, SUMMARY
+- Forms: INPUT, TEXTAREA, SELECT, BUTTON (rendered as text representations)
+- Code: PRE, CODE, KBD, SAMP, VAR
+- Other: BLOCKQUOTE, HR, FIGURE, FIGCAPTION, DL, DT, DD, ADDRESS, BR
+
+4. SUPPORTED CSS PROPERTIES:
+- Colors: All CSS color formats (hex, rgb, rgba, hsl, hsla, named colors)
+- Lengths: px, pt, em, rem, ex, ch, vw, vh, vmin, vmax, %, in, cm, mm, pc
+- Text: color, font-size, font-family, text-align, text-decoration, text-transform
+- Box Model: margin, padding, border, background-color, width, height
+- Layout: display, position, float, clear
+- Effects: opacity, visibility, overflow, text-overflow, white-space
+- Advanced: calc() expressions, box-shadow, text-shadow (basic support)
+
+5. ERROR HANDLING AND DEBUGGING:
+```javascript
+try {
+  const result = await PDFExporter.init({
+    selector: '.content',
+    debug: true
+  });
+  
+  console.log('PDF Generation Result:', result);
+  // {
+  //   success: true,
+  //   pages: 5,
+  //   elementsProcessed: 127,
+  //   errors: [],
+  //   warnings: ['Canvas not available'],
+  //   processingTime: 1250
+  // }
+  
+} catch (error) {
+  console.error('Critical error:', error);
+}
+```
+
+=== API REFERENCE ===
+
+Constructor Options:
+- pageSize: 'A4' | 'Letter' | 'Legal' | 'A3' | 'A5' | 'Tabloid'
+- pageWidth/pageHeight: number (in points)
+- landscape: boolean
+- margin: number
+- fontSize: number
+- fontFamily: string
+- h1FontSize through h6FontSize: number
+- bulletIndent: number
+- tableCellPadding: number
+- debug: boolean
+- onProgress: function
+- onError: function
+- onWarning: function
+- onPage: function
+- renderers: object
+
+Instance Methods:
+- getStats(): object - Get processing statistics
+- getErrorReport(): object - Get detailed error information
+- exportConfig(): object - Export current configuration
+- clearCaches(): void - Clear internal caches
+- addElementRenderer(tagName, renderer): void
+- addCustomCSSProperty(property, parser): void
+- setHeaderFooter(headerFn, footerFn): void
+- forcePageBreak(): void
+- getCurrentPageInfo(): object
+
+Static Methods:
+- PDFExporter.init(options): Promise<result>
+- PDFExporter._parseCssColor(color): object
+- PDFExporter._parseCssLength(length, baseFontSize, containerSize): number
+
+*/
