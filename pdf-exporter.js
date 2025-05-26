@@ -289,6 +289,53 @@ class PDFExporter {
     this.cursorY -= mb;
   }
 
+  save(filename) {
+    // Finalize streams for each page
+    this.pages.forEach(function(p) {
+      const content = this.streams[p.cid].join('');
+      const stream = '<< /Length ' + content.length + ' >> stream\n' + content + '\nendstream\n';
+      this.objects[p.cid - 1] = stream;
+    }, this);
+
+    // Pages tree
+    const kids = this.pages.map(p => p.pid + ' 0 R').join(' ');
+    const pagesObj = this._addObject('<< /Type /Pages /Count ' + this.pages.length + ' /Kids [' + kids + '] >>');
+
+    // Update parent references
+    this.objects = this.objects.map(obj => obj.replace('/Parent 0 0 R', '/Parent ' + pagesObj + ' 0 R'));
+
+    // Catalog
+    const catalog = this._addObject('<< /Type /Catalog /Pages ' + pagesObj + ' 0 R >>');
+
+    // Build PDF
+    let out = '%PDF-1.3\n';
+    this.objects.forEach((obj, i) => {
+      this.offsets[i] = out.length;
+      out += (i+1) + ' 0 obj\n' + obj + 'endobj\n';
+    });
+
+    // Xref
+    const xref = out.length;
+    out += 'xref\n0 ' + (this.objects.length+1) + '\n';
+    out += '0000000000 65535 f \n';
+    this.offsets.forEach(o => {
+      out += ('0000000000' + o).slice(-10) + ' 00000 n \n';
+    });
+
+    // Trailer
+    out += 'trailer<< /Size ' + (this.objects.length+1) + ' /Root ' + catalog + ' 0 R >>\n';
+    out += 'startxref\n' + xref + '\n%%EOF';
+
+    // Download
+    const blob = new Blob([out], { type: 'application/pdf' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = filename;
+    a.click();
+    URL.revokeObjectURL(url);
+  }
+
   static init(opts = {}) {
     const pdf = new PDFExporter(opts);
     pdf._newPage();
