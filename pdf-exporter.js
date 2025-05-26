@@ -7,6 +7,7 @@ class PDFExporter {
     this.offsets = [];
     this.pages = [];
     this.streams = {};
+    this.tables = [];
     this.pageWidth = 595.28;
     this.pageHeight = 841.89;
     this.margin = 40;
@@ -244,6 +245,52 @@ class PDFExporter {
     });
   }
 
+  // Gather table cell texts into a structured object
+  _prepareTable(tableEl) {
+    const headers = [];
+    const rows = [];
+    const thead = tableEl.querySelector('thead');
+    if (thead) {
+      Array.from(thead.querySelectorAll('tr')).forEach(tr => {
+        const cells = Array.from(tr.querySelectorAll('th')).map(th => th.textContent.trim());
+        headers.push(cells);
+      });
+    }
+    // All rows outside thead
+    Array.from(tableEl.querySelectorAll('tr')).forEach(tr => {
+      if (!thead || !thead.contains(tr)) {
+        const cells = Array.from(tr.querySelectorAll('td')).map(td => td.textContent.trim());
+        if (cells.length) rows.push(cells);
+      }
+    });
+    const colCount = headers[0] ? headers[0].length : (rows[0] ? rows[0].length : 0);
+    return { headers, rows, colCount, columnWidths: [] };
+  }
+
+  // Measure each column's max width based on cell content
+  _measureTable(tableData, styleState) {
+    const { headers, rows, colCount } = tableData;
+    const colWidths = new Array(colCount).fill(0);
+    // measure headers
+    headers.forEach(row => {
+      row.forEach((text, idx) => {
+        const w = this._textWidth(text, styleState.size);
+        if (w > colWidths[idx]) colWidths[idx] = w;
+      });
+    });
+    // measure body rows
+    rows.forEach(row => {
+      row.forEach((text, idx) => {
+        const w = this._textWidth(text, styleState.size);
+        if (w > colWidths[idx]) colWidths[idx] = w;
+      });
+    });
+    // add padding
+    const pad = this.tableCellPadding || 5;
+    for (let i = 0; i < colCount; i++) colWidths[i] += pad * 2;
+    tableData.columnWidths = colWidths;
+  }
+
   static init(opts) {
     const pdf = new PDFExporter();
     // List configuration
@@ -280,13 +327,13 @@ class PDFExporter {
             color: { r: 0, g: 0, b: 0 }
           }, tag === 'OL');
         }
-        else if (tag === 'TABLE')
-          Array.from(child.querySelectorAll('tr')).forEach(function(tr) {
-            const row = Array.from(tr.querySelectorAll('th,td'))
-              .map(function(td) { return td.textContent; })
-              .join(' | ');
-            pdf._drawText(row);
-          });
+        else if (tag === 'TABLE') {
+          // Pre-pass: collect and measure table data
+          const tableData = pdf._prepareTable(child);
+          pdf.tables.push(tableData);
+          pdf._measureTable(tableData, { size: pdf.fontSizes.normal });
+          // TODO: layout and render table using tableData.columnWidths and rows
+        }
         pdf.cursorY -= pdf.leading * 0.2;
       });
     });
