@@ -723,10 +723,12 @@ class PDFExporter {
         }
         if (tag==='H1') {
           console.log('PDFExporter H1 content:', child.textContent.trim()); // Diagnostic log
-          this._drawStyledText(child.textContent.trim(), { fontKey:'H', size:this.fontSizes.h1, color:styleState.color, indent:styleState.indent });
+          const normalizedText = this._normalizeText(child.textContent.trim());
+          this._drawStyledText(normalizedText, { fontKey:'H', size:this.fontSizes.h1, color:styleState.color, indent:styleState.indent });
         } else if (tag==='H2') {
           console.log('PDFExporter H2 content:', child.textContent.trim()); // Diagnostic log
-          this._drawStyledText(child.textContent.trim(), { fontKey:'B', size:this.fontSizes.h2, color:styleState.color, indent:styleState.indent });
+          const normalizedText = this._normalizeText(child.textContent.trim());
+          this._drawStyledText(normalizedText, { fontKey:'B', size:this.fontSizes.h2, color:styleState.color, indent:styleState.indent });
         } else if (tag==='P') {
           this._drawStyledText(child.textContent.trim(), styleState);
         } else if (tag==='UL'||tag==='OL') {
@@ -1180,6 +1182,22 @@ class PDFExporter {
         str += i.repeat(q);
     }
     return str;
+  }
+
+  // Helper method to normalize Unicode punctuation to ASCII equivalents
+  _normalizeText(text) {
+    if (!text) return text;
+    return text
+      .replace(/：/g, ':')    // Full-width colon to regular colon
+      .replace(/；/g, ';')    // Full-width semicolon to regular semicolon
+      .replace(/，/g, ',')    // Full-width comma to regular comma
+      .replace(/。/g, '.')    // Full-width period to regular period
+      .replace(/？/g, '?')    // Full-width question mark to regular question mark
+      .replace(/！/g, '!')    // Full-width exclamation mark to regular exclamation mark
+      .replace(/（/g, '(')    // Full-width left parenthesis to regular left parenthesis
+      .replace(/）/g, ')')    // Full-width right parenthesis to regular right parenthesis
+      .replace(/【/g, '[')    // Full-width left bracket to regular left bracket
+      .replace(/】/g, ']');   // Full-width right bracket to regular right bracket
   }
 }
 
