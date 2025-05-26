@@ -515,3 +515,8 @@ class PDFExporter {
 
 // Expose globally
 window.PDFExporter = PDFExporter;
+
+// Export for Node (CommonJS)
+if (typeof module !== 'undefined' && module.exports) {
+  module.exports = PDFExporter;
+}
