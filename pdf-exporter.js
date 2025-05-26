@@ -227,13 +227,33 @@ class PDFExporter {
     });
   }
 
+  // Draw nested lists with indenting and markers
+  _drawList(listEl, level, styleState, isOrdered) {
+    const items = Array.from(listEl.children).filter(el => el.tagName === 'LI');
+    items.forEach((li, idx) => {
+      const marker = isOrdered ? (idx + 1) + '. ' : '• ';
+      const state = Object.assign({}, styleState, { indent: this.bulletIndent * level });
+      this._drawStyledText(marker + li.textContent.trim(), state);
+      // handle nested lists
+      Array.from(li.children).forEach(child => {
+        const tag = child.tagName;
+        if (tag === 'UL' || tag === 'OL') {
+          this._drawList(child, level + 1, styleState, tag === 'OL');
+        }
+      });
+    });
+  }
+
   static init(opts) {
-    var pdf = new PDFExporter();
+    const pdf = new PDFExporter();
+    // List configuration
+    pdf.bulletIndent = opts.bulletIndent || 20;
+    pdf.hangingIndent = opts.hangingIndent || pdf.bulletIndent;
     pdf._newPage();
-    var els = document.querySelectorAll(opts.selector);
+    const els = document.querySelectorAll(opts.selector);
     els.forEach(function(el) {
       Array.from(el.children).forEach(function(child) {
-        var tag = child.tagName;
+        const tag = child.tagName;
         if (tag === 'H1') {
           pdf._processInline(child, {
             fontKey: 'H',
@@ -253,13 +273,16 @@ class PDFExporter {
             color: { r: 0, g: 0, b: 0 }
           });
         }
-        else if (tag === 'UL')
-          Array.from(child.querySelectorAll('li')).forEach(function(li) {
-            pdf._drawText('• ' + li.textContent);
-          });
+        else if (tag === 'UL' || tag === 'OL') {
+          pdf._drawList(child, 0, {
+            fontKey: 'N',
+            size: pdf.fontSizes.normal,
+            color: { r: 0, g: 0, b: 0 }
+          }, tag === 'OL');
+        }
         else if (tag === 'TABLE')
           Array.from(child.querySelectorAll('tr')).forEach(function(tr) {
-            var row = Array.from(tr.querySelectorAll('th,td'))
+            const row = Array.from(tr.querySelectorAll('th,td'))
               .map(function(td) { return td.textContent; })
               .join(' | ');
             pdf._drawText(row);
