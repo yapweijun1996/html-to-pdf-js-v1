@@ -47,6 +47,8 @@ class PDFExporter {
     this.styleCache = new WeakMap();
     // Hook called after each new page is created: (pdfInstance, pageIndex)
     this.onPage = typeof opts.onPage === 'function' ? opts.onPage : null;
+    // Custom element renderers: {TAGNAME: (node, styleState, pdf) => {}} 
+    this.renderers = opts.renderers && typeof opts.renderers === 'object' ? opts.renderers : {};
   }
 
   _addObject(content) {
@@ -415,9 +417,15 @@ class PDFExporter {
     const pt = PDFExporter._parseCssLength(cs.paddingTop, styleState.size);
     this.cursorY -= pt;
     Array.from(el.childNodes).forEach(child => {
-      if (child.nodeType === 3) this._processInline(child, styleState);
-      else if (child.nodeType === 1) {
+      if (child.nodeType === 3) {
+        this._processInline(child, styleState);
+      } else if (child.nodeType === 1) {
         const tag = child.tagName;
+        // Plugin renderer override
+        if (this.renderers[tag]) {
+          this.renderers[tag](child, styleState, this);
+          return;
+        }
         if (tag==='H1') {
           this._drawStyledText(child.textContent.trim(), { fontKey:'H', size:this.fontSizes.h1, color:styleState.color, indent:styleState.indent });
         } else if (tag==='H2') {
