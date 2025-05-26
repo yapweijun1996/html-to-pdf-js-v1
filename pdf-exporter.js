@@ -291,6 +291,23 @@ class PDFExporter {
     tableData.columnWidths = colWidths;
   }
 
+  // Distribute column widths to fill the available page width
+  _layoutTable(tableData) {
+    const colWidths = tableData.columnWidths;
+    const totalMin = colWidths.reduce((sum, w) => sum + w, 0);
+    const avail = this.pageWidth - 2 * this.margin;
+    if (totalMin === 0) return;
+    if (totalMin < avail) {
+      // add extra space equally
+      const extra = (avail - totalMin) / colWidths.length;
+      tableData.columnWidths = colWidths.map(w => w + extra);
+    } else if (totalMin > avail) {
+      // shrink proportionally
+      const ratio = avail / totalMin;
+      tableData.columnWidths = colWidths.map(w => w * ratio);
+    }
+  }
+
   static init(opts) {
     const pdf = new PDFExporter();
     // List configuration
@@ -328,11 +345,13 @@ class PDFExporter {
           }, tag === 'OL');
         }
         else if (tag === 'TABLE') {
-          // Pre-pass: collect and measure table data
+          // Pre-pass: collect, measure, and layout table data
+          const styleState = { size: pdf.fontSizes.normal };
           const tableData = pdf._prepareTable(child);
           pdf.tables.push(tableData);
-          pdf._measureTable(tableData, { size: pdf.fontSizes.normal });
-          // TODO: layout and render table using tableData.columnWidths and rows
+          pdf._measureTable(tableData, styleState);
+          pdf._layoutTable(tableData);
+          // TODO: render table using tableData.columnWidths
         }
         pdf.cursorY -= pdf.leading * 0.2;
       });
