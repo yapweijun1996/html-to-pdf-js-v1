@@ -53,7 +53,7 @@ class PDFExporter {
       // Custom list bullet settings with validation
       this.ulBulletSymbols = Array.isArray(opts.ulBulletSymbols) && opts.ulBulletSymbols.length
         ? opts.ulBulletSymbols.map(s => String(s))
-        : ['- '];
+        : ['• '];
       this.olBulletFormat = typeof opts.olBulletFormat === 'function'
         ? opts.olBulletFormat
         : ((idx, level) => `${idx+1}. `);
