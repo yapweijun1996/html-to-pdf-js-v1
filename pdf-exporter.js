@@ -820,94 +820,113 @@ class PDFExporter {
 
   // Nested lists with indent and ASCII bullet (now customizable)
   _drawList(listEl, level, styleState, isOrdered) {
-    const items = Array.from(listEl.children).filter(el => el.tagName === 'LI');
-    const cs = this._getStyle(listEl);
-    const listStyleType = cs.listStyleType || (isOrdered ? 'decimal' : 'disc');
-
-    items.forEach((li, idx) => {
-      this._ensureSpace(1);
-
-      let bulletText = '';
-      if (listStyleType !== 'none') {
-        if (isOrdered) {
-            // Use custom formatter if available and listStyleType is not one we directly handle as ordinal
-            const handledOrdinalTypes = ['decimal', 'lower-alpha', 'lower-latin', 'upper-alpha', 'upper-latin', 'lower-roman', 'upper-roman'];
-            if (typeof this.olBulletFormat === 'function' && !handledOrdinalTypes.includes(listStyleType)) {
-                bulletText = this.olBulletFormat(idx, level);
-            } else {
-                bulletText = this._getOrdinal(idx, listStyleType);
-            }
-        } else { // Unordered list
-            switch (listStyleType) {
-                case 'circle':
-                    bulletText = '◦ '; // ◦
-                    break;
-                case 'square':
-                    bulletText = '▪ '; // ▪ (or use ■ ■ for filled square)
-                    break;
-                case 'disc': // Explicitly handle disc
-                default: // For any other listStyleType not explicitly circle or square, default to disc
-                    bulletText = '• '; // •
-                    break;
-            }
-        }
-      }
-
-      const liBaseIndent = this.bulletIndent * level;
-      const yPosBeforeItem = this.cursorY;
-
-      // Draw bullet text using _drawCell directly for precise control.
-      this._drawCell(bulletText, styleState.fontKey, styleState.size, this.margin + liBaseIndent, yPosBeforeItem, styleState.color);
-
-      // Calculate indent for the actual list item content, flowing next to the bullet.
-      const bulletWidth = this._textWidth(bulletText, styleState.size);
-      // Add a small gap (e.g., 20% of font size) after the bullet before the content starts.
-      const contentIndent = liBaseIndent + bulletWidth + (styleState.size * 0.2);
-
-      // Create style state for the LI's content.
-      // _processInline will be called for childNodes, and it (via _drawStyledText)
-      // will use this new 'indent' and the current 'this.cursorY'.
-      const itemContentStyle = { ...styleState, indent: contentIndent };
+    try {
+      const items = Array.from(listEl.children).filter(el => el.tagName === 'LI');
+      const cs = this._getStyle(listEl);
+      const listStyleType = cs.listStyleType || (isOrdered ? 'decimal' : 'disc');
       
-      // Reset cursor Y for the content processing to align vertically with the bullet.
-      // _processInline will then draw text starting from this Y position.
-      this.cursorY = yPosBeforeItem;
+      // Get precise measurements from HTML computed styles
+      const listPaddingLeft = PDFExporter._parseCssLength(cs.paddingLeft, styleState.size);
+      const listMarginLeft = PDFExporter._parseCssLength(cs.marginLeft, styleState.size);
+      
+      // Calculate precise indentation based on HTML styles
+      // Default browser list indentation is typically 40px (padding-left)
+      const baseIndent = listPaddingLeft || 40;
+      const levelIndent = baseIndent * (level + 1);
+      
+      items.forEach((li, idx) => {
+        this._ensureSpace(1);
 
-      let contentWasProcessed = false;
-      Array.from(li.childNodes).forEach(childNode => {
-        // Skip child nodes that are themselves lists (they are handled separately below)
-        // and skip purely whitespace text nodes for the purpose of the contentWasProcessed flag.
-        if (childNode.nodeType === Node.ELEMENT_NODE && (childNode.tagName === 'UL' || childNode.tagName === 'OL')) {
-          return;
+        let bulletText = '';
+        if (listStyleType !== 'none') {
+          if (isOrdered) {
+              // Use custom formatter if available and listStyleType is not one we directly handle as ordinal
+              const handledOrdinalTypes = ['decimal', 'lower-alpha', 'lower-latin', 'upper-alpha', 'upper-latin', 'lower-roman', 'upper-roman'];
+              if (typeof this.olBulletFormat === 'function' && !handledOrdinalTypes.includes(listStyleType)) {
+                  bulletText = this.olBulletFormat(idx, level);
+              } else {
+                  bulletText = this._getOrdinal(idx, listStyleType);
+              }
+          } else { // Unordered list
+              switch (listStyleType) {
+                  case 'circle':
+                      bulletText = '◦ '; // ◦
+                      break;
+                  case 'square':
+                      bulletText = '▪ '; // ▪ (or use ■ ■ for filled square)
+                      break;
+                  case 'disc': // Explicitly handle disc
+                  default: // For any other listStyleType not explicitly circle or square, default to disc
+                      bulletText = '• '; // •
+                      break;
+              }
+          }
         }
-        if (childNode.nodeType === Node.TEXT_NODE && childNode.textContent.trim() === '') {
-          return;
-        }
+
+        const yPosBeforeItem = this.cursorY;
         
-        this._processInline(childNode, itemContentStyle);
-        // Check if _processInline actually drew something and moved the cursor.
-        // It's possible it processed an empty text node or an element that rendered nothing.
-        if (this.cursorY < yPosBeforeItem) {
-            contentWasProcessed = true;
-        }
-      });
+        // Get LI computed styles for precise positioning
+        const liCs = this._getStyle(li);
+        const liPaddingLeft = PDFExporter._parseCssLength(liCs.paddingLeft, styleState.size);
+        const liMarginLeft = PDFExporter._parseCssLength(liCs.marginLeft, styleState.size);
+        
+        // Calculate bullet position - typically 16px from the left edge of the list
+        const bulletIndentFromList = 16; // Standard browser bullet position
+        const bulletX = this.margin + (styleState.indent || 0) + levelIndent - bulletIndentFromList;
 
-      // If no actual inline content was processed (e.g., <li></li> or <li><p></p></li> where <p> is empty,
-      // or if _processInline didn't move the cursor), we still need to account for the line height of the bullet.
-      if (!contentWasProcessed) {
-        this.cursorY = yPosBeforeItem - (styleState.size * 1.2); // Move cursor down for the bullet's line.
-      }
-      // If content was processed, cursorY is already updated by _drawStyledText calls within _processInline.
-
-      // Process nested lists that are direct children of this LI.
-      Array.from(li.children).forEach(childLiElement => {
-        if (['UL','OL'].includes(childLiElement.tagName)) {
-          // Nested lists start at 'level+1'. Their indent is relative to page margin.
-          // The styleState for nested lists should be the original styleState, not itemContentStyle.
-          this._drawList(childLiElement, level + 1, styleState, childLiElement.tagName === 'OL');
+        // Draw bullet text using _drawCell directly for precise control.
+        if (bulletText) {
+          this._drawCell(bulletText, styleState.fontKey, styleState.size, bulletX, yPosBeforeItem, styleState.color);
         }
+
+        // Calculate indent for the actual list item content
+        // Content starts at the list's padding-left position
+        const contentIndent = (styleState.indent || 0) + levelIndent + liPaddingLeft;
+
+        // Create style state for the LI's content.
+        const itemContentStyle = { 
+          ...styleState, 
+          indent: contentIndent,
+          availableWidth: (styleState.availableWidth || (this.pageWidth - 2 * this.margin)) - contentIndent
+        };
+        
+        // Reset cursor Y for the content processing to align vertically with the bullet.
+        this.cursorY = yPosBeforeItem;
+
+        let contentWasProcessed = false;
+        Array.from(li.childNodes).forEach(childNode => {
+          // Skip child nodes that are themselves lists (they are handled separately below)
+          // and skip purely whitespace text nodes for the purpose of the contentWasProcessed flag.
+          if (childNode.nodeType === Node.ELEMENT_NODE && (childNode.tagName === 'UL' || childNode.tagName === 'OL')) {
+            return;
+          }
+          if (childNode.nodeType === Node.TEXT_NODE && childNode.textContent.trim() === '') {
+            return;
+          }
+          
+          this._processInline(childNode, itemContentStyle);
+          // Check if _processInline actually drew something and moved the cursor.
+          if (this.cursorY < yPosBeforeItem) {
+              contentWasProcessed = true;
+          }
+        });
+
+        // If no actual inline content was processed, we still need to account for the line height of the bullet.
+        if (!contentWasProcessed) {
+          this.cursorY = yPosBeforeItem - (styleState.size * 1.2); // Move cursor down for the bullet's line.
+        }
+
+        // Process nested lists that are direct children of this LI.
+        Array.from(li.children).forEach(childLiElement => {
+          if (['UL','OL'].includes(childLiElement.tagName)) {
+            // Nested lists start at 'level+1'. Their indent is relative to page margin.
+            this._drawList(childLiElement, level + 1, styleState, childLiElement.tagName === 'OL');
+          }
+        });
       });
-    });
+    } catch (error) {
+      this._handleError('List rendering failed', error);
+    }
   }
 
   // Prepare table cell elements
@@ -921,17 +940,49 @@ class PDFExporter {
 
   // Measure minimum widths per column
   _measureTable(tableData, styleState) {
-    const pad = this.tableCellPadding;
-    const widths = Array(tableData.colCount).fill(0);
-    tableData.headers.forEach(row => row.forEach((cell, i) => {
-      const w = this._textWidth(cell.textContent.trim(), styleState.size) + pad*2;
-      widths[i] = Math.max(widths[i], w);
-    }));
-    tableData.rows.forEach(row => row.forEach((cell, i) => {
-      const w = this._textWidth(cell.textContent.trim(), styleState.size) + pad*2;
-      widths[i] = Math.max(widths[i], w);
-    }));
-    tableData.columnWidths = widths;
+    try {
+      const widths = Array(tableData.colCount).fill(0);
+      
+      // Measure headers with precise padding
+      tableData.headers.forEach(row => row.forEach((cell, i) => {
+        const cs = this._getStyle(cell);
+        const paddingLeft = PDFExporter._parseCssLength(cs.paddingLeft, styleState.size) || 8;
+        const paddingRight = PDFExporter._parseCssLength(cs.paddingRight, styleState.size) || 8;
+        const totalPadding = paddingLeft + paddingRight;
+        
+        const textWidth = this._textWidth(cell.textContent.trim(), styleState.size);
+        const cellWidth = textWidth + totalPadding;
+        widths[i] = Math.max(widths[i], cellWidth);
+      }));
+      
+      // Measure body cells with precise padding
+      tableData.rows.forEach(row => row.forEach((cell, i) => {
+        const cs = this._getStyle(cell);
+        const paddingLeft = PDFExporter._parseCssLength(cs.paddingLeft, styleState.size) || 8;
+        const paddingRight = PDFExporter._parseCssLength(cs.paddingRight, styleState.size) || 8;
+        const totalPadding = paddingLeft + paddingRight;
+        
+        const textWidth = this._textWidth(cell.textContent.trim(), styleState.size);
+        const cellWidth = textWidth + totalPadding;
+        widths[i] = Math.max(widths[i], cellWidth);
+      }));
+      
+      tableData.columnWidths = widths;
+    } catch (error) {
+      this._handleError('Table measurement failed', error);
+      // Fallback to original method
+      const pad = this.tableCellPadding;
+      const widths = Array(tableData.colCount).fill(0);
+      tableData.headers.forEach(row => row.forEach((cell, i) => {
+        const w = this._textWidth(cell.textContent.trim(), styleState.size) + pad*2;
+        widths[i] = Math.max(widths[i], w);
+      }));
+      tableData.rows.forEach(row => row.forEach((cell, i) => {
+        const w = this._textWidth(cell.textContent.trim(), styleState.size) + pad*2;
+        widths[i] = Math.max(widths[i], w);
+      }));
+      tableData.columnWidths = widths;
+    }
   }
 
   // Distribute to fit page width
@@ -951,7 +1002,6 @@ class PDFExporter {
 
   // Render table rows across pages with multi-line cell support
   _renderTable(tableData, styleState) {
-    const pad = this.tableCellPadding;
     const fontSize = styleState.size;
     const lineHeight = fontSize * 1.2;
     const x0 = this.margin + (styleState.indent || 0); // Tables should be indented based on parent block's indent
@@ -964,14 +1014,19 @@ class PDFExporter {
       ...tableData.rows.map(r => ({ cells: r, header: false }))
     ];
 
-    // Helper to wrap text within a cell
-    const wrapText = (text, maxW) => {
+    // Helper to wrap text within a cell with precise padding
+    const wrapText = (text, maxW, cellEl) => {
+      const cs = this._getStyle(cellEl);
+      const paddingLeft = PDFExporter._parseCssLength(cs.paddingLeft, fontSize) || 8;
+      const paddingRight = PDFExporter._parseCssLength(cs.paddingRight, fontSize) || 8;
+      const availableWidth = maxW - paddingLeft - paddingRight;
+      
       const words = text.split(' ');
       const lines = [];
       let current = '';
       words.forEach(word => {
         const test = current ? current + ' ' + word : word;
-        if (this._textWidth(test, fontSize) > maxW - pad * 2 && current) {
+        if (this._textWidth(test, fontSize) > availableWidth && current) {
           lines.push(current);
           current = word;
         } else {
@@ -982,13 +1037,28 @@ class PDFExporter {
       return lines;
     };
 
-    // Precompute wrapped lines and row heights
+    // Precompute wrapped lines and row heights with precise padding
     const cellLines = allRows.map(({ cells }) =>
-      cells.map((cell, ci) => wrapText(cell.textContent.trim(), widths[ci]))
+      cells.map((cell, ci) => wrapText(cell.textContent.trim(), widths[ci], cell))
     );
-    const rowHeights = cellLines.map(linesArr => {
+    
+    const rowHeights = cellLines.map((linesArr, rowIndex) => {
+      const { cells } = allRows[rowIndex];
       const maxLines = Math.max(...linesArr.map(lines => lines.length));
-      return maxLines * lineHeight + pad * 2;
+      
+      // Get precise padding for height calculation
+      let maxPaddingTop = 0;
+      let maxPaddingBottom = 0;
+      
+      cells.forEach(cell => {
+        const cs = this._getStyle(cell);
+        const paddingTop = PDFExporter._parseCssLength(cs.paddingTop, fontSize) || 4;
+        const paddingBottom = PDFExporter._parseCssLength(cs.paddingBottom, fontSize) || 4;
+        maxPaddingTop = Math.max(maxPaddingTop, paddingTop);
+        maxPaddingBottom = Math.max(maxPaddingBottom, paddingBottom);
+      });
+      
+      return maxLines * lineHeight + maxPaddingTop + maxPaddingBottom;
     });
 
     let rowCursor = 0;
@@ -1018,12 +1088,12 @@ class PDFExporter {
       });
       this._write(`${x0 + totalW} ${yTop} m ${x0 + totalW} ${yTop - sumH} l S\n`);
 
-      // Render each row
+      // Render each row with precise padding
       for (; rowCursor < end; rowCursor++) {
         const { cells, header } = allRows[rowCursor];
         const linesArr = cellLines[rowCursor];
         const height = rowHeights[rowCursor];
-        const yTextStart = this.cursorY - pad - fontSize;
+        
         accX = x0;
 
         cells.forEach((cellEl, ci) => {
@@ -1031,11 +1101,25 @@ class PDFExporter {
           const align = cs.textAlign;
           const lines = linesArr[ci];
           const colW = widths[ci];
+          
+          // Get precise padding for this cell
+          const paddingLeft = PDFExporter._parseCssLength(cs.paddingLeft, fontSize) || 8;
+          const paddingTop = PDFExporter._parseCssLength(cs.paddingTop, fontSize) || 4;
+          
+          const yTextStart = this.cursorY - paddingTop - fontSize;
+          
           lines.forEach((ln, li) => {
             const tw = this._textWidth(ln, fontSize);
-            let x = accX + pad;
-            if (align === 'center') x = accX + (colW - tw) / 2;
-            else if (align === 'right') x = accX + colW - pad - tw;
+            let x = accX + paddingLeft;
+            
+            if (align === 'center') {
+              const availableWidth = colW - paddingLeft - (PDFExporter._parseCssLength(cs.paddingRight, fontSize) || 8);
+              x = accX + paddingLeft + (availableWidth - tw) / 2;
+            } else if (align === 'right') {
+              const paddingRight = PDFExporter._parseCssLength(cs.paddingRight, fontSize) || 8;
+              x = accX + colW - paddingRight - tw;
+            }
+            
             const y = yTextStart - li * lineHeight;
             this._drawCell(ln, header ? 'B' : 'N', fontSize, x, y, null);
           });
@@ -1103,6 +1187,32 @@ class PDFExporter {
     const bbs = cs.borderBottomStyle;
     const bls = cs.borderLeftStyle;
 
+    // Enhanced border detection - check for shorthand border properties
+    let hasBorder = btw > 0 || brw > 0 || bbw > 0 || blw > 0;
+    let finalBorderProps = {btw, brw, bbw, blw, btc, brc, bbc, blc, bts, brs, bbs, bls};
+    
+    // Check for shorthand border property if individual borders are not set
+    if (!hasBorder && cs.border && cs.border !== 'none' && cs.border !== '0') {
+      const borderParts = cs.border.split(/\s+/);
+      if (borderParts.length >= 1) {
+        const borderWidth = PDFExporter._parseCssLength(borderParts[0], baseFontSize);
+        if (borderWidth > 0) {
+          // Apply border to all sides
+          const borderColor = borderParts.length > 2 ? PDFExporter._parseCssColor(borderParts[2]) : { r: 0, g: 0, b: 0, a: 1 };
+          const borderStyle = borderParts.length > 1 ? borderParts[1] : 'solid';
+          
+          // Override individual border properties with shorthand values
+          finalBorderProps = {
+            btw: borderWidth, brw: borderWidth, bbw: borderWidth, blw: borderWidth,
+            btc: borderColor, brc: borderColor, bbc: borderColor, blc: borderColor,
+            bts: borderStyle, brs: borderStyle, bbs: borderStyle, bls: borderStyle
+          };
+          
+          hasBorder = true;
+        }
+      }
+    }
+
     // Background fill (now respects padding)
     const bg = cs.backgroundColor;
     const c = PDFExporter._parseCssColor(bg);
@@ -1122,13 +1232,16 @@ class PDFExporter {
 
     // Border (now respects padding and individual side widths/colors)
     // This logic draws borders if an explicit height is set. Auto-height border drawing is handled later.
-    if (explicitHeight > 0 && (btw > 0 || brw > 0 || bbw > 0 || blw > 0)) {
+    if (explicitHeight > 0 && hasBorder) {
         const x = this.margin + parentIndent;
         const y = this.cursorY - pt - explicitHeight - pb;
         const w = currentBlockContentWidth + pl + pr;
         const h = explicitHeight + pt + pb;
 
-        this._drawBorders(x, y, w, h, {btw, brw, bbw, blw}, {btc, brc, bbc, blc}, {bts, brs, bbs, bls});
+        this._drawBorders(x, y, w, h, 
+          {btw: finalBorderProps.btw, brw: finalBorderProps.brw, bbw: finalBorderProps.bbw, blw: finalBorderProps.blw}, 
+          {btc: finalBorderProps.btc, brc: finalBorderProps.brc, bbc: finalBorderProps.bbc, blc: finalBorderProps.blc}, 
+          {bts: finalBorderProps.bts, brs: finalBorderProps.brs, bbs: finalBorderProps.bbs, bls: finalBorderProps.bls});
     }
 
     this.cursorY -= pt; // Apply padding top
@@ -1194,7 +1307,7 @@ class PDFExporter {
 
     // If height was auto and we drew background/border, we might need to redraw or adjust them here.
     // This is a complex part of a full box model. For now, background/border with auto height are limited.
-    if (explicitHeight === 0 && (c.a > 0 || btw > 0 || brw > 0 || bbw > 0 || blw > 0)) {
+    if (explicitHeight === 0 && (c.a > 0 || hasBorder)) {
         const calculatedHeight = yBeforeContent - yAfterContent; // Height of the content drawn
         if (calculatedHeight > 0) {
             // Redraw background if it was auto-height and content was drawn
@@ -1208,20 +1321,16 @@ class PDFExporter {
                 this._write(`${x.toFixed(3)} ${y.toFixed(3)} ${width.toFixed(3)} ${bgHeight.toFixed(3)} re f\n`);
                 this._write('0 0 0 rg\n');
             }
-            // Redraw border (simplified)
-            if (btw > 0 || brw > 0 || bbw > 0 || blw > 0) {
-                const borderProps = {btw, brw, bbw, blw};
-                const borderColors = {btc, brc, bbc, blc};
-                const borderStyles = {bts, brs, bbs, bls};
-                const hasAnyBorder = Object.values(borderProps).some(width => width > 0);
-
-                if (hasAnyBorder) {
-                    const x = this.margin + parentIndent;
-                    const y = yAfterContent - pb;
-                    const w = currentBlockContentWidth + pl + pr;
-                    const h = calculatedHeight + pt + pb;
-                    this._drawBorders(x, y, w, h, borderProps, borderColors, borderStyles);
-                }
+            // Redraw border with enhanced detection
+            if (hasBorder) {
+                const x = this.margin + parentIndent;
+                const y = yAfterContent - pb;
+                const w = currentBlockContentWidth + pl + pr;
+                const h = calculatedHeight + pt + pb;
+                this._drawBorders(x, y, w, h, 
+                  {btw: finalBorderProps.btw, brw: finalBorderProps.brw, bbw: finalBorderProps.bbw, blw: finalBorderProps.blw}, 
+                  {btc: finalBorderProps.btc, brc: finalBorderProps.brc, bbc: finalBorderProps.bbc, blc: finalBorderProps.blc}, 
+                  {bts: finalBorderProps.bts, brs: finalBorderProps.brs, bbs: finalBorderProps.bbs, bls: finalBorderProps.bls});
             }
         }
     }
@@ -1233,41 +1342,52 @@ class PDFExporter {
   }
 
   _drawBorders(x, y, w, h, widths, colors, styles) {
-    // Helper to draw a single border line
-    const drawLine = (x1, y1, x2, y2, lineWidth, color, style) => {
-        if (lineWidth > 0 && color.a > 0) {
-            this._write(`${color.r.toFixed(3)} ${color.g.toFixed(3)} ${color.b.toFixed(3)} RG\n`);
-            this._write(`${lineWidth.toFixed(3)} w\n`);
+    try {
+      // Helper to draw a single border line with enhanced styling
+      const drawLine = (x1, y1, x2, y2, lineWidth, color, style) => {
+          if (lineWidth > 0 && color.a > 0) {
+              this._write(`${color.r.toFixed(3)} ${color.g.toFixed(3)} ${color.b.toFixed(3)} RG\n`);
+              this._write(`${lineWidth.toFixed(3)} w\n`);
 
-            // Apply line dash pattern for styles like dashed or dotted
-            if (style === 'dashed') {
-                this._write(`[${(lineWidth * 3).toFixed(3)} ${(lineWidth * 2).toFixed(3)}] 0 d\n`); // Dash pattern: 3*width dash, 2*width gap
-            } else if (style === 'dotted') {
-                this._write(`[${lineWidth.toFixed(3)} ${lineWidth.toFixed(3)}] 0 d\n`);       // Dash pattern: 1*width dot, 1*width gap (results in square dots)
-            } else {
-                this._write('[] 0 d\n'); // Solid line (empty dash array)
-            }
+              // Apply line dash pattern for styles like dashed or dotted
+              if (style === 'dashed') {
+                  this._write(`[${(lineWidth * 3).toFixed(3)} ${(lineWidth * 2).toFixed(3)}] 0 d\n`); // Dash pattern: 3*width dash, 2*width gap
+              } else if (style === 'dotted') {
+                  this._write(`[${lineWidth.toFixed(3)} ${lineWidth.toFixed(3)}] 0 d\n`);       // Dash pattern: 1*width dot, 1*width gap (results in square dots)
+              } else if (style === 'double') {
+                  // Draw double border by drawing two lines
+                  const offset = lineWidth / 3;
+                  this._write('[] 0 d\n'); // Solid line
+                  this._write(`${x1.toFixed(3)} ${(y1 + offset).toFixed(3)} m ${x2.toFixed(3)} ${(y2 + offset).toFixed(3)} l S\n`);
+                  this._write(`${x1.toFixed(3)} ${(y1 - offset).toFixed(3)} m ${x2.toFixed(3)} ${(y2 - offset).toFixed(3)} l S\n`);
+                  return; // Skip the normal line drawing
+              } else {
+                  this._write('[] 0 d\n'); // Solid line (empty dash array)
+              }
 
-            this._write(`${x1.toFixed(3)} ${y1.toFixed(3)} m ${x2.toFixed(3)} ${y2.toFixed(3)} l S\n`);
-            this._write('[] 0 d\n'); // Reset dash pattern to solid for subsequent drawings
-        }
-    };
+              this._write(`${x1.toFixed(3)} ${y1.toFixed(3)} m ${x2.toFixed(3)} ${y2.toFixed(3)} l S\n`);
+              this._write('[] 0 d\n'); // Reset dash pattern to solid for subsequent drawings
+          }
+      };
 
-    // PDF coordinate system: y increases upwards. h is height. x,y is bottom-left typically for rects.
-    // Top border
-    drawLine(x + widths.blw / 2, y + h - widths.btw / 2, x + w - widths.brw / 2, y + h - widths.btw / 2, widths.btw, colors.btc, styles.bts);
+      // PDF coordinate system: y increases upwards. h is height. x,y is bottom-left typically for rects.
+      // Top border
+      drawLine(x + widths.blw / 2, y + h - widths.btw / 2, x + w - widths.brw / 2, y + h - widths.btw / 2, widths.btw, colors.btc, styles.bts);
 
-    // Right border
-    drawLine(x + w - widths.brw / 2, y + widths.bbw / 2, x + w - widths.brw / 2, y + h - widths.btw / 2, widths.brw, colors.brc, styles.brs);
+      // Right border
+      drawLine(x + w - widths.brw / 2, y + widths.bbw / 2, x + w - widths.brw / 2, y + h - widths.btw / 2, widths.brw, colors.brc, styles.brs);
 
-    // Bottom border
-    drawLine(x + widths.blw / 2, y + widths.bbw / 2, x + w - widths.brw / 2, y + widths.bbw / 2, widths.bbw, colors.bbc, styles.bbs);
+      // Bottom border
+      drawLine(x + widths.blw / 2, y + widths.bbw / 2, x + w - widths.brw / 2, y + widths.bbw / 2, widths.bbw, colors.bbc, styles.bbs);
 
-    // Left border
-    drawLine(x + widths.blw / 2, y + widths.bbw / 2, x + widths.blw / 2, y + h - widths.btw / 2, widths.blw, colors.blc, styles.bls);
+      // Left border
+      drawLine(x + widths.blw / 2, y + widths.bbw / 2, x + widths.blw / 2, y + h - widths.btw / 2, widths.blw, colors.blc, styles.bls);
 
-    // Reset to default stroke color and line width (dash pattern is reset in drawLine)
-    this._write('0 0 0 RG\n1 w\n');
+      // Reset to default stroke color and line width (dash pattern is reset in drawLine)
+      this._write('0 0 0 RG\n1 w\n');
+    } catch (error) {
+      this._handleError('Border drawing failed', error);
+    }
   }
 
   // Placeholder for image preprocessing - will be implemented in a subsequent step
@@ -2217,6 +2337,154 @@ class PDFExporter {
     };
   }
 
+  // Utility method to inspect HTML computed styles for debugging and measurements
+  inspectElementStyles(element, properties = []) {
+    try {
+      const cs = this._getStyle(element);
+      const defaultProps = [
+        'paddingLeft', 'paddingRight', 'paddingTop', 'paddingBottom',
+        'marginLeft', 'marginRight', 'marginTop', 'marginBottom',
+        'borderLeftWidth', 'borderRightWidth', 'borderTopWidth', 'borderBottomWidth',
+        'borderLeftColor', 'borderRightColor', 'borderTopColor', 'borderBottomColor',
+        'borderLeftStyle', 'borderRightStyle', 'borderTopStyle', 'borderBottomStyle',
+        'border', 'backgroundColor', 'color', 'fontSize', 'fontFamily',
+        'textAlign', 'lineHeight', 'display', 'width', 'height'
+      ];
+      
+      const propsToInspect = properties.length > 0 ? properties : defaultProps;
+      const styleInfo = {
+        tagName: element.tagName,
+        className: element.className,
+        id: element.id,
+        computedStyles: {},
+        parsedValues: {}
+      };
+      
+      propsToInspect.forEach(prop => {
+        const value = cs[prop];
+        styleInfo.computedStyles[prop] = value;
+        
+        // Parse common CSS values for debugging
+        if (prop.includes('padding') || prop.includes('margin') || prop.includes('Width') || prop.includes('Height')) {
+          styleInfo.parsedValues[prop] = PDFExporter._parseCssLength(value, 12);
+        } else if (prop.includes('Color') || prop === 'backgroundColor' || prop === 'color') {
+          styleInfo.parsedValues[prop] = PDFExporter._parseCssColor(value);
+        }
+      });
+      
+      return styleInfo;
+    } catch (error) {
+      this._handleError('Style inspection failed', error);
+      return { error: error.message };
+    }
+  }
+
+  // Batch inspect multiple elements
+  inspectMultipleElements(selector, properties = []) {
+    try {
+      const elements = document.querySelectorAll(selector);
+      return Array.from(elements).map(el => this.inspectElementStyles(el, properties));
+    } catch (error) {
+      this._handleError('Multiple element inspection failed', error);
+      return [];
+    }
+  }
+
+  // Analyze HTML vs PDF differences and provide recommendations
+  analyzeLayoutDifferences(selector = 'body') {
+    try {
+      const analysis = {
+        lists: [],
+        tables: [],
+        sections: [],
+        recommendations: []
+      };
+      
+      // Analyze lists
+      const lists = document.querySelectorAll(`${selector} ul, ${selector} ol`);
+      lists.forEach(list => {
+        const listInfo = this.inspectElementStyles(list, ['paddingLeft', 'marginLeft', 'listStyleType']);
+        const firstLi = list.querySelector('li');
+        if (firstLi) {
+          const liInfo = this.inspectElementStyles(firstLi, ['paddingLeft', 'marginLeft']);
+          analysis.lists.push({
+            type: list.tagName.toLowerCase(),
+            listPadding: listInfo.parsedValues.paddingLeft || 0,
+            listMargin: listInfo.parsedValues.marginLeft || 0,
+            liPadding: liInfo.parsedValues.paddingLeft || 0,
+            liMargin: liInfo.parsedValues.marginLeft || 0,
+            listStyleType: listInfo.computedStyles.listStyleType,
+            element: list
+          });
+        }
+      });
+      
+      // Analyze tables
+      const tables = document.querySelectorAll(`${selector} table`);
+      tables.forEach(table => {
+        const firstCell = table.querySelector('td, th');
+        if (firstCell) {
+          const cellInfo = this.inspectElementStyles(firstCell, ['paddingLeft', 'paddingRight', 'paddingTop', 'paddingBottom']);
+          analysis.tables.push({
+            cellPaddingLeft: cellInfo.parsedValues.paddingLeft || 0,
+            cellPaddingRight: cellInfo.parsedValues.paddingRight || 0,
+            cellPaddingTop: cellInfo.parsedValues.paddingTop || 0,
+            cellPaddingBottom: cellInfo.parsedValues.paddingBottom || 0,
+            element: table
+          });
+        }
+      });
+      
+      // Analyze sections with borders
+      const sections = document.querySelectorAll(`${selector} section, ${selector} div, ${selector} article`);
+      sections.forEach(section => {
+        const sectionInfo = this.inspectElementStyles(section, ['border', 'borderWidth', 'borderColor', 'borderStyle', 'backgroundColor']);
+        if (sectionInfo.computedStyles.border !== 'none' && sectionInfo.computedStyles.border !== '0px none rgb(0, 0, 0)') {
+          analysis.sections.push({
+            border: sectionInfo.computedStyles.border,
+            backgroundColor: sectionInfo.computedStyles.backgroundColor,
+            element: section
+          });
+        }
+      });
+      
+      // Generate recommendations
+      if (analysis.lists.length > 0) {
+        const avgListPadding = analysis.lists.reduce((sum, list) => sum + list.listPadding, 0) / analysis.lists.length;
+        analysis.recommendations.push({
+          type: 'list-indentation',
+          current: this.bulletIndent,
+          recommended: Math.round(avgListPadding),
+          reason: `HTML lists average ${avgListPadding.toFixed(1)}px padding-left`
+        });
+      }
+      
+      if (analysis.tables.length > 0) {
+        const avgCellPadding = analysis.tables.reduce((sum, table) => 
+          sum + (table.cellPaddingLeft + table.cellPaddingRight) / 2, 0) / analysis.tables.length;
+        analysis.recommendations.push({
+          type: 'table-cell-padding',
+          current: this.tableCellPadding,
+          recommended: Math.round(avgCellPadding),
+          reason: `HTML table cells average ${avgCellPadding.toFixed(1)}px horizontal padding`
+        });
+      }
+      
+      if (analysis.sections.length > 0) {
+        analysis.recommendations.push({
+          type: 'section-borders',
+          count: analysis.sections.length,
+          reason: `Found ${analysis.sections.length} sections with borders that may need enhanced rendering`
+        });
+      }
+      
+      return analysis;
+    } catch (error) {
+      this._handleError('Layout analysis failed', error);
+      return { error: error.message };
+    }
+  }
+
   // Force page break
   forcePageBreak() {
     this._newPage();
@@ -2362,6 +2630,36 @@ try {
 }
 ```
 
+6. MEASUREMENT-BASED FINE-TUNING:
+```javascript
+// Create PDF instance for analysis
+const pdf = new PDFExporter({ debug: true });
+
+// Analyze layout differences and get recommendations
+const analysis = pdf.analyzeLayoutDifferences('.content');
+console.log('Layout Analysis:', analysis);
+// {
+//   lists: [{ type: 'ul', listPadding: 40, liPadding: 0, ... }],
+//   tables: [{ cellPaddingLeft: 8, cellPaddingRight: 8, ... }],
+//   sections: [{ border: '1px solid #ccc', ... }],
+//   recommendations: [
+//     { type: 'list-indentation', current: 20, recommended: 40, reason: '...' },
+//     { type: 'table-cell-padding', current: 5, recommended: 8, reason: '...' }
+//   ]
+// }
+
+// Inspect specific elements
+const listStyles = pdf.inspectElementStyles(document.querySelector('ul'));
+console.log('List Styles:', listStyles);
+
+// Apply recommendations and regenerate
+await PDFExporter.init({
+  selector: '.content',
+  bulletIndent: analysis.recommendations.find(r => r.type === 'list-indentation')?.recommended || 20,
+  tableCellPadding: analysis.recommendations.find(r => r.type === 'table-cell-padding')?.recommended || 5
+});
+```
+
 === API REFERENCE ===
 
 Constructor Options:
@@ -2391,6 +2689,9 @@ Instance Methods:
 - setHeaderFooter(headerFn, footerFn): void
 - forcePageBreak(): void
 - getCurrentPageInfo(): object
+- inspectElementStyles(element, properties): object - Inspect computed styles for debugging
+- inspectMultipleElements(selector, properties): array - Batch inspect elements
+- analyzeLayoutDifferences(selector): object - Analyze HTML vs PDF differences and get recommendations
 
 Static Methods:
 - PDFExporter.init(options): Promise<result>
