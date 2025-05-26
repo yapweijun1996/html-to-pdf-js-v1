@@ -60,7 +60,9 @@ class PDFExporter {
 
       // Built-in fonts with error handling
       try {
-        this.fH = this._addObject('<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica-Bold >>'); // Header font
+        // Allow customizable header font (default to regular Helvetica for headers)
+        const headerFont = opts.headerFont || 'Helvetica';
+        this.fH = this._addObject(`<< /Type /Font /Subtype /Type1 /BaseFont /${headerFont} >>`); // Header font
         this.fB = this._addObject('<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica-Bold >>'); // Bold font
         this.fI = this._addObject('<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica-Oblique >>'); // Italic font
         this.fN = this._addObject('<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>'); // Normal font
@@ -70,7 +72,7 @@ class PDFExporter {
         throw new Error('Critical error: Cannot initialize PDF fonts');
       }
       
-      // Canvas for text measurement with fallback
+      // Canvas for text measurement with robust fallback
       this.ctx = null;
       this._lastFontSpec = null;
       this.isNodeEnvironment = typeof window === 'undefined' || typeof document === 'undefined';
@@ -81,12 +83,15 @@ class PDFExporter {
           this.ctx = c.getContext('2d');
           if (!this.ctx) {
             this._addWarning('Canvas context not available, using fallback text measurement');
+            this.ctx = this._createFallbackContext();
           }
         } catch(e) { 
           this._addWarning('Canvas not available, using fallback text measurement');
+          this.ctx = this._createFallbackContext();
         }
       } else {
         this._addWarning('Running in Node.js environment, using fallback text measurement');
+        this.ctx = this._createFallbackContext();
       }
       
       this.fontFamily = this._validateString(opts.fontFamily, 'Helvetica', 'fontFamily');
@@ -165,18 +170,36 @@ class PDFExporter {
   _validateNumber(value, defaultValue, fieldName) {
     if (value === undefined || value === null) return defaultValue;
     
-    // Attempt type conversion for strings that represent numbers
+    // Attempt strict type conversion for strings that represent pure numbers
     if (typeof value === 'string') {
-      const parsed = parseFloat(value);
+      // Trim whitespace and check for pure numeric strings
+      const trimmed = value.trim();
+      
+      // Reject strings with units or non-numeric characters (except decimal point and minus)
+      if (!/^-?\d*\.?\d+$/.test(trimmed)) {
+        this._addWarning(`Invalid ${fieldName}: "${value}" contains non-numeric characters, using default: ${defaultValue}`);
+        return defaultValue;
+      }
+      
+      const parsed = parseFloat(trimmed);
       if (!isNaN(parsed) && isFinite(parsed)) {
         value = parsed;
+      } else {
+        this._addWarning(`Invalid ${fieldName}: "${value}" could not be parsed as number, using default: ${defaultValue}`);
+        return defaultValue;
       }
     }
     
-    if (typeof value !== 'number' || isNaN(value) || value < 0) {
-      this._addWarning(`Invalid ${fieldName}: ${value}, using default: ${defaultValue}`);
+    if (typeof value !== 'number' || isNaN(value) || !isFinite(value)) {
+      this._addWarning(`Invalid ${fieldName}: ${value} is not a valid number, using default: ${defaultValue}`);
       return defaultValue;
     }
+    
+    if (value < 0) {
+      this._addWarning(`Invalid ${fieldName}: ${value} must be non-negative, using default: ${defaultValue}`);
+      return defaultValue;
+    }
+    
     return value;
   }
 
@@ -380,6 +403,27 @@ class PDFExporter {
       }
     }
     return width;
+  }
+
+  /**
+   * Creates a fallback context object that mimics canvas measureText functionality
+   * Used when running in Node.js or when canvas is not available
+   * @returns {Object} Fallback context with measureText method
+   */
+  _createFallbackContext() {
+    const self = this;
+    return {
+      font: '',
+      measureText: function(text) {
+        // Extract font size from the font string (e.g., "12px Helvetica")
+        const fontSizeMatch = this.font.match(/(\d+(?:\.\d+)?)px/);
+        const fontSize = fontSizeMatch ? parseFloat(fontSizeMatch[1]) : 12;
+        
+        return {
+          width: self._fallbackTextWidth(text, fontSize)
+        };
+      }
+    };
   }
 
   /**
