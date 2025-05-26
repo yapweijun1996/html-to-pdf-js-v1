@@ -83,7 +83,12 @@ class PDFExporter {
 
   _textWidth(text, size) {
     if (this.ctx) {
-      this.ctx.font = `${size}px ${this.fontFamily}`;
+      // Only reset canvas font if it changed
+      const spec = `${size}px ${this.fontFamily}`;
+      if (this._lastFontSpec !== spec) {
+        this.ctx.font = spec;
+        this._lastFontSpec = spec;
+      }
       return this.ctx.measureText(text).width;
     }
     return text.length * size * 0.5;
