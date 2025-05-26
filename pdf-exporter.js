@@ -41,6 +41,7 @@ class PDFExporter {
     this.fB = this._addObject('<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica-Bold >>');
     this.fI = this._addObject('<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica-Oblique >>');
     this.fN = this._addObject('<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>');
+    this.fM = this._addObject('<< /Type /Font /Subtype /Type1 /BaseFont /Courier >>'); // Monospace font
     // Canvas for text measurement
     try { const c = document.createElement('canvas'); this.ctx = c.getContext('2d'); }
     catch(e) { this.ctx = null; }
@@ -63,15 +64,15 @@ class PDFExporter {
     // Create a separate object for page resources (fonts, XObjects)
     // This object will be referenced by the Page object.
     // Initially, it only contains fonts. XObjects will be added later.
-    const fontResources = `<< /H ${this.fH} 0 R /B ${this.fB} 0 R /I ${this.fI} 0 R /N ${this.fN} 0 R >>`;
-    const pageResourcesContent = `<< /Font ${fontResources} /XObject << >> >>`; // Placeholder for XObjects
+    const fontResources = `<< /H ${this.fH} 0 R /B ${this.fB} 0 R /I ${this.fI} 0 R /N ${this.fN} 0 R /M ${this.fM} 0 R >>`;
+    const pageResourcesContent = `<< /Font ${fontResources} /XObject << >> >>`;
     const resId = this._addObject(pageResourcesContent);
 
     const pid = this._addObject(
       `<< /Type /Page /Parent 0 0 R /MediaBox [0 0 ${this.pageWidth} ${this.pageHeight}] ` +
       `/Contents ${cid} 0 R /Resources ${resId} 0 R >>`
     );
-    this.pages.push({ pid, cid, resId, imageResourceMap: {} }); // Store resId and map for image resources
+    this.pages.push({ pid, cid, resId, imageResourceMap: {}, annotations: [] }); // Store resId, map for image resources, and annotations array
     this.streams[cid] = [];
     this.cursorY = this.pageHeight - this.margin;
     this.currentPageImageCounter = 0; // For naming image resources on this page (e.g., Im1, Im2)
@@ -206,41 +207,184 @@ class PDFExporter {
 
   // Styled inline text with wrapping and indent
   _drawStyledText(text, styleState) {
-    const { fontKey, size, color, indent = 0 } = styleState;
+    const { fontKey, size, color, indent = 0, linkURI, isLink, isUnderlined, isStrikethrough, isSubscript, isSuperscript, isMarked, markBackgroundColor, availableWidth, textAlign } = styleState;
     this._ensureSpace(1);
-    const maxWidth = this.pageWidth - 2 * this.margin - indent;
+    // Max width for text is the availableWidth from parent block, or page width if not specified.
+    const effectiveMaxWidth = availableWidth ? availableWidth : (this.pageWidth - 2 * this.margin - indent);
+
     let line = '';
+    const originalColor = color; // Keep original color for non-link parts if a link has specific color
+
     text.split(' ').forEach(word => {
       const test = line + word + ' ';
-      if (this._textWidth(test.trim(), size) > maxWidth && line) {
-        const y = this.cursorY;
-        this._drawCell(line.trim(), fontKey, size, this.margin + indent, y, color);
-        this.cursorY -= size * 1.2;
+      if (this._textWidth(test.trim(), size) > effectiveMaxWidth && line) {
+        const lineContent = line.trim();
+        let yBaseline = this.cursorY;
+        let xDraw = this.margin + indent;
+        const textWidthVal = this._textWidth(lineContent, size);
+
+        if (textAlign === 'center') {
+            xDraw = this.margin + indent + (effectiveMaxWidth - textWidthVal) / 2;
+        } else if (textAlign === 'right') {
+            xDraw = this.margin + indent + (effectiveMaxWidth - textWidthVal);
+        }
+
+        let currentFontSize = size;
+        if (isSubscript) {
+          yBaseline -= currentFontSize * 0.2; // Lower baseline
+        } else if (isSuperscript) {
+          yBaseline += currentFontSize * 0.35; // Raise baseline
+        }
+
+        // Draw background for <mark>
+        if (isMarked && markBackgroundColor && markBackgroundColor.a > 0) {
+            const xBg = xDraw - 1; // Small padding
+            const yBg = yBaseline - (currentFontSize * 0.75) - 1; // From approx ascent
+            const bgWidth = textWidthVal + 2; // Small padding
+            const bgHeight = currentFontSize + 2; // Full line height plus padding
+            this._write(`${markBackgroundColor.r.toFixed(3)} ${markBackgroundColor.g.toFixed(3)} ${markBackgroundColor.b.toFixed(3)} rg\n`);
+            this._write(`${xBg.toFixed(3)} ${yBg.toFixed(3)} ${bgWidth.toFixed(3)} ${bgHeight.toFixed(3)} re f\n`);
+            this._write(`${originalColor.r.toFixed(3)} ${originalColor.g.toFixed(3)} ${originalColor.b.toFixed(3)} rg\n`); // Reset to text color
+        }
+
+        this._drawCell(lineContent, fontKey, currentFontSize, xDraw, yBaseline, originalColor);
+        if (linkURI) {
+          // Define the clickable rectangle for this line segment
+          const rect = [xDraw, yBaseline - (currentFontSize * 0.25), xDraw + textWidthVal, yBaseline + (currentFontSize * 0.75)];
+          this._addLinkAnnotation(rect, linkURI);
+        }
+        if (isLink || isUnderlined) { // Draw underline for links or <u> tags
+            const yUnderline = yBaseline - (currentFontSize * 0.15); // Position underline slightly below baseline
+            this._write(`${xDraw.toFixed(3)} ${yUnderline.toFixed(3)} m ${(xDraw + textWidthVal).toFixed(3)} ${yUnderline.toFixed(3)} l S\n`);
+        }
+        if (isStrikethrough) { // Draw strikethrough for <s> or <del> tags
+            const yStrikethrough = yBaseline + (currentFontSize * 0.25); // Position strikethrough in the middle of the text
+            this._write(`${xDraw.toFixed(3)} ${yStrikethrough.toFixed(3)} m ${(xDraw + textWidthVal).toFixed(3)} ${yStrikethrough.toFixed(3)} l S\n`);
+        }
+
+        this.cursorY -= size * 1.2; // Original size for line height advancement
         line = word + ' ';
       } else line = test;
     });
     if (line) {
-      const y = this.cursorY;
-      this._drawCell(line.trim(), fontKey, size, this.margin + indent, y, color);
-      this.cursorY -= size * 1.2;
+      const lineContent = line.trim();
+      let yBaseline = this.cursorY;
+      let xDraw = this.margin + indent;
+      const textWidthVal = this._textWidth(lineContent, size);
+      let currentFontSize = size;
+
+      if (textAlign === 'center') {
+        xDraw = this.margin + indent + (effectiveMaxWidth - textWidthVal) / 2;
+      } else if (textAlign === 'right') {
+        xDraw = this.margin + indent + (effectiveMaxWidth - textWidthVal);
+      }
+
+      if (isSubscript) {
+        yBaseline -= currentFontSize * 0.2;
+      } else if (isSuperscript) {
+        yBaseline += currentFontSize * 0.35;
+      }
+
+      // Draw background for <mark>
+      if (isMarked && markBackgroundColor && markBackgroundColor.a > 0) {
+        const xBg = xDraw -1; // Small padding
+        const yBg = yBaseline - (currentFontSize * 0.75) -1; // From approx ascent
+        const bgWidth = textWidthVal + 2; // Small padding
+        const bgHeight = currentFontSize + 2; // Full line height plus padding
+        this._write(`${markBackgroundColor.r.toFixed(3)} ${markBackgroundColor.g.toFixed(3)} ${markBackgroundColor.b.toFixed(3)} rg\n`);
+        this._write(`${xBg.toFixed(3)} ${yBg.toFixed(3)} ${bgWidth.toFixed(3)} ${bgHeight.toFixed(3)} re f\n`);
+        this._write(`${originalColor.r.toFixed(3)} ${originalColor.g.toFixed(3)} ${originalColor.b.toFixed(3)} rg\n`); // Reset to text color for the text itself
+      }
+
+      this._drawCell(lineContent, fontKey, currentFontSize, xDraw, yBaseline, originalColor);
+      if (linkURI) {
+        const rect = [xDraw, yBaseline - (currentFontSize * 0.25), xDraw + textWidthVal, yBaseline + (currentFontSize * 0.75)];
+        this._addLinkAnnotation(rect, linkURI);
+      }
+      if (isLink || isUnderlined) { // Draw underline for links or <u> tags
+        const yUnderline = yBaseline - (currentFontSize * 0.15);
+        this._write(`${xDraw.toFixed(3)} ${yUnderline.toFixed(3)} m ${(xDraw + textWidthVal).toFixed(3)} ${yUnderline.toFixed(3)} l S\n`);
+      }
+      if (isStrikethrough) { // Draw strikethrough for <s> or <del> tags
+          const yStrikethrough = yBaseline + (currentFontSize * 0.25);
+          this._write(`${xDraw.toFixed(3)} ${yStrikethrough.toFixed(3)} m ${(xDraw + textWidthVal).toFixed(3)} ${yStrikethrough.toFixed(3)} l S\n`);
+      }
+      this.cursorY -= size * 1.2; // Original size for line height advancement
     }
   }
 
   // Recursively process inline <strong>,<em>,<span style> etc.
   _processInline(node, styleState) {
     if (node.nodeType === Node.TEXT_NODE) {
-      const txt = node.textContent.trim();
+      const txt = node.textContent.trim(); // Trim to avoid drawing empty spaces that might still add annotations
       if (txt) this._drawStyledText(txt, styleState);
     } else if (node.nodeType === Node.ELEMENT_NODE) {
+      const cs = this._getStyle(node);
+      if (cs.display === 'none') {
+        return; // Skip rendering this element and its children
+      }
+
       const newStyle = { ...styleState };
       const tag = node.tagName.toUpperCase();
       if (tag === 'STRONG' || tag === 'B') newStyle.fontKey = 'B';
       if (tag === 'EM' || tag === 'I') newStyle.fontKey = 'I';
-      const cs = this._getStyle(node);
-      if (cs.color) newStyle.color = PDFExporter._parseCssColor(cs.color);
-      newStyle.size = PDFExporter._parseCssLength(cs.fontSize, styleState.size);
+      
+      newStyle.color = cs.color ? PDFExporter._parseCssColor(cs.color) : styleState.color;
+      newStyle.size = PDFExporter._parseCssLength(cs.fontSize, styleState.size) || styleState.size;
+
+      if (tag === 'A') {
+        newStyle.linkURI = node.getAttribute('href');
+        // Default link color to blue if not specified by CSS
+        if (!cs.color) {
+          newStyle.color = { r: 0, g: 0, b: 1, a: 1 }; // Blue
+        }
+        newStyle.isLink = true; // Flag to indicate this text segment is part of a link for underlining
+      }
+      if (tag === 'U') {
+        newStyle.isUnderlined = true;
+      }
+      if (tag === 'S' || tag === 'DEL') {
+        newStyle.isStrikethrough = true;
+      }
+      if (tag === 'SUB') {
+        newStyle.isSubscript = true;
+        newStyle.size = (newStyle.size || this.fontSizes.normal) * 0.7; // Reduce font size
+      }
+      if (tag === 'SUP') {
+        newStyle.isSuperscript = true;
+        newStyle.size = (newStyle.size || this.fontSizes.normal) * 0.7; // Reduce font size
+      }
+      if (tag === 'MARK') {
+        newStyle.isMarked = true;
+        // Default mark background to yellow if not specified by CSS
+        // Note: _getStyle(node).backgroundColor will usually be transparent unless explicitly set on <mark>
+        // So we apply a default yellow here if no specific background is found on the mark itself.
+        const markBgColor = PDFExporter._parseCssColor(cs.backgroundColor);
+        if (markBgColor.a === 0) { // If transparent (or default black transparent)
+            newStyle.markBackgroundColor = { r: 1, g: 1, b: 0, a: 1 }; // Yellow
+        } else {
+            newStyle.markBackgroundColor = markBgColor;
+        }
+      }
+      if (tag === 'SMALL') {
+        newStyle.size = (newStyle.size || this.fontSizes.normal) * 0.85; // Reduce font size slightly
+      }
+      if (['CODE', 'KBD', 'SAMP', 'VAR'].includes(tag)) {
+        newStyle.fontKey = 'M'; // Use Monospace font
+        // Optionally, slightly different background for code blocks if not styled by CSS.
+        // For now, just changing fontKey. CSS background-color on these elements would be respected by _processBlock if they were block.
+        // For inline, if a specific background is desired for code, it can be added similarly to <mark>
+      }
+
       // Recursively process all child nodes with inherited styles
-      Array.from(node.childNodes).forEach(child => this._processInline(child, newStyle));
+      // except for <br> which is handled directly to force a line break.
+      if (tag === 'BR') {
+        this.cursorY -= newStyle.size * 1.2; // Advance cursor by one line height based on current style's size
+        this._ensureSpace(1); // Ensure we have space on a new page if needed
+        // No further processing for BR itself, it just moves the cursor.
+      } else {
+        Array.from(node.childNodes).forEach(child => this._processInline(child, newStyle));
+      }
     }
   }
 
@@ -336,9 +480,11 @@ class PDFExporter {
   }
 
   // Distribute to fit page width
-  _layoutTable(tableData) {
+  _layoutTable(tableData, styleState) {
     const total = tableData.columnWidths.reduce((a,b)=>a+b,0);
-    const avail = this.pageWidth - 2*this.margin;
+    // Available width for table is constrained by parent block's availableWidth or page width.
+    const avail = styleState.availableWidth || (this.pageWidth - 2*this.margin);
+
     if (total < avail) {
       const extra = (avail-total)/tableData.columnWidths.length;
       tableData.columnWidths = tableData.columnWidths.map(w=>w+extra);
@@ -353,7 +499,7 @@ class PDFExporter {
     const pad = this.tableCellPadding;
     const fontSize = styleState.size;
     const lineHeight = fontSize * 1.2;
-    const x0 = this.margin;
+    const x0 = this.margin + (styleState.indent || 0); // Tables should be indented based on parent block's indent
     const widths = tableData.columnWidths;
     const totalW = widths.reduce((a, b) => a + b, 0);
 
@@ -454,38 +600,97 @@ class PDFExporter {
   // Process any block-level element: margins, padding, background, border, then children
   _processBlock(el, styleState) {
     const cs = this._getStyle(el);
-    const mt = PDFExporter._parseCssLength(cs.marginTop, styleState.size);
+    if (cs.display === 'none') {
+        return; // Skip rendering this element and its children
+    }
+
+    const baseFontSize = styleState.size; // Use current styleState size as base for em units
+    const parentIndent = styleState.indent || 0;
+    const parentAvailableWidth = styleState.availableWidth || (this.pageWidth - 2 * this.margin - parentIndent);
+
+    // Margins
+    const mt = PDFExporter._parseCssLength(cs.marginTop, baseFontSize);
     this.cursorY -= mt;
-    // Background fill
+    this._ensureSpace(0); // Check for new page after margin top
+
+    // Padding
+    const pt = PDFExporter._parseCssLength(cs.paddingTop, baseFontSize);
+    const pr = PDFExporter._parseCssLength(cs.paddingRight, baseFontSize);
+    const pb = PDFExporter._parseCssLength(cs.paddingBottom, baseFontSize);
+    const pl = PDFExporter._parseCssLength(cs.paddingLeft, baseFontSize);
+
+    // Determine content width for this block
+    const parsedCssWidth = PDFExporter._parseCssLength(cs.width, baseFontSize);
+    let currentBlockContentWidth;
+    if (parsedCssWidth > 0) {
+        currentBlockContentWidth = Math.min(parsedCssWidth, parentAvailableWidth - pl - pr); // Cannot exceed parent's available content width minus own padding
+    } else {
+        currentBlockContentWidth = parentAvailableWidth - pl - pr;
+    }
+
+    // Background and Border calculations need to consider padding and the block's actual content width.
+    let explicitHeight = PDFExporter._parseCssLength(cs.height, baseFontSize);
+    const yBeforeContent = this.cursorY;
+
+    // Border properties (individual sides)
+    const btw = PDFExporter._parseCssLength(cs.borderTopWidth, baseFontSize);
+    const brw = PDFExporter._parseCssLength(cs.borderRightWidth, baseFontSize);
+    const bbw = PDFExporter._parseCssLength(cs.borderBottomWidth, baseFontSize);
+    const blw = PDFExporter._parseCssLength(cs.borderLeftWidth, baseFontSize);
+
+    const btc = PDFExporter._parseCssColor(cs.borderTopColor);
+    const brc = PDFExporter._parseCssColor(cs.borderRightColor);
+    const bbc = PDFExporter._parseCssColor(cs.borderBottomColor);
+    const blc = PDFExporter._parseCssColor(cs.borderLeftColor);
+
+    const bts = cs.borderTopStyle;
+    const brs = cs.borderRightStyle;
+    const bbs = cs.borderBottomStyle;
+    const bls = cs.borderLeftStyle;
+
+    // Background fill (now respects padding)
     const bg = cs.backgroundColor;
     const c = PDFExporter._parseCssColor(bg);
-    const height = PDFExporter._parseCssLength(cs.height, styleState.size);
-    if (c.a > 0 && height > 0) {
-      const x = this.margin;
-      const width = this.pageWidth - 2 * this.margin;
-      const y = this.cursorY - height;
-      this._write(`${c.r.toFixed(3)} ${c.g.toFixed(3)} ${c.b.toFixed(3)} rg\n`);
-      this._write(`${x} ${y} ${width} ${height} re f\n`);
-      this._write('0 0 0 rg\n');
+    if (c.a > 0) {
+      const x = this.margin + parentIndent;
+      const y = explicitHeight > 0 ? (this.cursorY - pt - explicitHeight - pb) : (this.cursorY - pt);
+      const width = currentBlockContentWidth + pl + pr; // Background width is content + padding
+      
+      let bgHeight = explicitHeight > 0 ? explicitHeight + pt + pb : 0;
+      
+      if (bgHeight > 0) { // Only draw if an explicit height allows it, or defer if auto (not implemented yet)
+        this._write(`${c.r.toFixed(3)} ${c.g.toFixed(3)} ${c.b.toFixed(3)} rg\n`);
+        this._write(`${x.toFixed(3)} ${y.toFixed(3)} ${width.toFixed(3)} ${bgHeight.toFixed(3)} re f\n`);
+        this._write('0 0 0 rg\n'); // Reset to black
+      }
     }
-    const bw = PDFExporter._parseCssLength(cs.borderWidth, styleState.size);
-    if (bw > 0) {
-      const bc = PDFExporter._parseCssColor(cs.borderColor);
-      this._write(`${bc.r.toFixed(3)} ${bc.g.toFixed(3)} ${bc.b.toFixed(3)} RG\n`);
-      const x = this.margin;
-      const y = this.cursorY - height;
-      const w = this.pageWidth - 2 * this.margin;
-      const h = height;
-      this._write(`${x} ${y} ${w} ${h} re S\n`);
-      this._write('0 0 0 RG\n');
+
+    // Border (now respects padding and individual side widths/colors)
+    // This logic draws borders if an explicit height is set. Auto-height border drawing is handled later.
+    if (explicitHeight > 0 && (btw > 0 || brw > 0 || bbw > 0 || blw > 0)) {
+        const x = this.margin + parentIndent;
+        const y = this.cursorY - pt - explicitHeight - pb;
+        const w = currentBlockContentWidth + pl + pr;
+        const h = explicitHeight + pt + pb;
+
+        this._drawBorders(x, y, w, h, {btw, brw, bbw, blw}, {btc, brc, bbc, blc}, {bts, brs, bbs, bls});
     }
-    const pt = PDFExporter._parseCssLength(cs.paddingTop, styleState.size);
-    this.cursorY -= pt;
+
+    this.cursorY -= pt; // Apply padding top
+
+    // Create new style state for children, including new indent based on this block's padding-left.
+    const childStyleState = {
+         ...styleState,
+         indent: parentIndent + pl,
+         availableWidth: currentBlockContentWidth, // Children operate within this block's content width
+         textAlign: cs.textAlign || styleState.textAlign // Inherit or override textAlign
+    };
+
     Array.from(el.childNodes).forEach(child => {
       if (child.nodeType === 3) {
-        this._processInline(child, styleState);
+        this._processInline(child, childStyleState);
       } else if (child.nodeType === 1) {
-        const tag = child.tagName;
+        const tag = child.tagName.toUpperCase(); // Ensure tag is uppercase
         // Plugin renderer override
         if (this.renderers[tag]) {
           this.renderers[tag](child, styleState, this);
@@ -501,9 +706,9 @@ class PDFExporter {
           this._drawList(child, 0, styleState, tag==='OL');
         } else if (tag==='TABLE') {
           const td = this._prepareTable(child);
-          this._measureTable(td, styleState);
-          this._layoutTable(td);
-          this._renderTable(td, styleState);
+          this._measureTable(td, childStyleState); // Pass childStyleState for font size
+          this._layoutTable(td, childStyleState); // Pass childStyleState for availableWidth
+          this._renderTable(td, childStyleState); // Pass childStyleState for indent and font size
         } else if (tag === 'HR') {
           this._ensureSpace(1); 
           const hrY = this.cursorY - (styleState.size * 0.6); // Position rule in approx middle of current line space
@@ -517,17 +722,91 @@ class PDFExporter {
           this._ensureSpace(1); // Ensure space before processing blockquote's content
           this._processBlock(child, quoteStyle); // 'child' is the BLOCKQUOTE element, process its children with new style
           this.cursorY -= (this.fontSizes.normal * 0.5); // Simulate a small bottom margin
-        } else if (tag === 'IMG') {
+        } else if (tag === 'IMG' || tag === 'CANVAS') {
           this._drawImage(child, styleState);
         } else {
           this._processBlock(child, styleState);
         }
       }
     });
-    const pb = PDFExporter._parseCssLength(cs.paddingBottom, styleState.size);
-    this.cursorY -= pb;
-    const mb = PDFExporter._parseCssLength(cs.marginBottom, styleState.size);
+    const yAfterContent = this.cursorY;
+
+    // If height was auto and we drew background/border, we might need to redraw or adjust them here.
+    // This is a complex part of a full box model. For now, background/border with auto height are limited.
+    if (explicitHeight === 0 && (c.a > 0 || btw > 0 || brw > 0 || bbw > 0 || blw > 0)) {
+        const calculatedHeight = yBeforeContent - yAfterContent; // Height of the content drawn
+        if (calculatedHeight > 0) {
+            // Redraw background if it was auto-height and content was drawn
+            if (c.a > 0) {
+                const x = this.margin + parentIndent;
+                const y = yAfterContent - pb;
+                const width = currentBlockContentWidth + pl + pr; // Use current block's content width + padding
+                const bgHeight = calculatedHeight + pt + pb; 
+
+                this._write(`${c.r.toFixed(3)} ${c.g.toFixed(3)} ${c.b.toFixed(3)} rg\n`);
+                this._write(`${x.toFixed(3)} ${y.toFixed(3)} ${width.toFixed(3)} ${bgHeight.toFixed(3)} re f\n`);
+                this._write('0 0 0 rg\n');
+            }
+            // Redraw border (simplified)
+            if (btw > 0 || brw > 0 || bbw > 0 || blw > 0) {
+                const borderProps = {btw, brw, bbw, blw};
+                const borderColors = {btc, brc, bbc, blc};
+                const borderStyles = {bts, brs, bbs, bls};
+                const hasAnyBorder = Object.values(borderProps).some(width => width > 0);
+
+                if (hasAnyBorder) {
+                    const x = this.margin + parentIndent;
+                    const y = yAfterContent - pb;
+                    const w = currentBlockContentWidth + pl + pr;
+                    const h = calculatedHeight + pt + pb;
+                    this._drawBorders(x, y, w, h, borderProps, borderColors, borderStyles);
+                }
+            }
+        }
+    }
+
+    this.cursorY -= pb; // Apply padding bottom
+    const mb = PDFExporter._parseCssLength(cs.marginBottom, baseFontSize);
     this.cursorY -= mb;
+    this._ensureSpace(0); // Check for new page after margin bottom
+  }
+
+  _drawBorders(x, y, w, h, widths, colors, styles) {
+    // Helper to draw a single border line
+    const drawLine = (x1, y1, x2, y2, lineWidth, color, style) => {
+        if (lineWidth > 0 && color.a > 0) {
+            this._write(`${color.r.toFixed(3)} ${color.g.toFixed(3)} ${color.b.toFixed(3)} RG\n`);
+            this._write(`${lineWidth.toFixed(3)} w\n`);
+
+            // Apply line dash pattern for styles like dashed or dotted
+            if (style === 'dashed') {
+                this._write(`[${(lineWidth * 3).toFixed(3)} ${(lineWidth * 2).toFixed(3)}] 0 d\n`); // Dash pattern: 3*width dash, 2*width gap
+            } else if (style === 'dotted') {
+                this._write(`[${lineWidth.toFixed(3)} ${lineWidth.toFixed(3)}] 0 d\n`);       // Dash pattern: 1*width dot, 1*width gap (results in square dots)
+            } else {
+                this._write('[] 0 d\n'); // Solid line (empty dash array)
+            }
+
+            this._write(`${x1.toFixed(3)} ${y1.toFixed(3)} m ${x2.toFixed(3)} ${y2.toFixed(3)} l S\n`);
+            this._write('[] 0 d\n'); // Reset dash pattern to solid for subsequent drawings
+        }
+    };
+
+    // PDF coordinate system: y increases upwards. h is height. x,y is bottom-left typically for rects.
+    // Top border
+    drawLine(x + widths.blw / 2, y + h - widths.btw / 2, x + w - widths.brw / 2, y + h - widths.btw / 2, widths.btw, colors.btc, styles.bts);
+
+    // Right border
+    drawLine(x + w - widths.brw / 2, y + widths.bbw / 2, x + w - widths.brw / 2, y + h - widths.btw / 2, widths.brw, colors.brc, styles.brs);
+
+    // Bottom border
+    drawLine(x + widths.blw / 2, y + widths.bbw / 2, x + w - widths.brw / 2, y + widths.bbw / 2, widths.bbw, colors.bbc, styles.bbs);
+
+    // Left border
+    drawLine(x + widths.blw / 2, y + widths.bbw / 2, x + widths.blw / 2, y + h - widths.btw / 2, widths.blw, colors.blc, styles.bls);
+
+    // Reset to default stroke color and line width (dash pattern is reset in drawLine)
+    this._write('0 0 0 RG\n1 w\n');
   }
 
   // Placeholder for image preprocessing - will be implemented in a subsequent step
@@ -538,8 +817,8 @@ class PDFExporter {
     elements.forEach(element => {
       element.querySelectorAll('img').forEach(img => {
         const promise = (async () => {
+          let src = img.getAttribute('src'); // Define src here to be available in catch
           try {
-            const src = img.getAttribute('src');
             if (!src) return;
 
             let response;
@@ -585,6 +864,29 @@ class PDFExporter {
           } catch (error) {
             console.error('Error processing image:', src, error);
             this.imageDataCache.set(img, { error: true }); // Mark as errored
+          }
+        })();
+        imagePromises.push(promise);
+      });
+
+      // Handle <canvas> elements
+      element.querySelectorAll('canvas').forEach(canvasEl => {
+        const promise = (async () => {
+          try {
+            if (canvasEl.width === 0 || canvasEl.height === 0) {
+                console.warn("Canvas element has zero width or height, skipping.", canvasEl);
+                return;
+            }
+            const dataUrl = canvasEl.toDataURL('image/png'); // Default to PNG for transparency
+            this.imageDataCache.set(canvasEl, {
+              dataUrl,
+              type: 'image/png',
+              width: canvasEl.width,
+              height: canvasEl.height
+            });
+          } catch (error) {
+            console.error('Error processing canvas:', canvasEl, error);
+            this.imageDataCache.set(canvasEl, { error: true }); // Mark as errored
           }
         })();
         imagePromises.push(promise);
@@ -694,12 +996,21 @@ class PDFExporter {
         for (const imgName in p.imageResourceMap) {
           xobjectEntries += `/${imgName} ${p.imageResourceMap[imgName]} 0 R `;
         }
-        // Fetch the existing Font resources part
         const currentResourceObjContent = this.objects[p.resId - 1];
         const fontMatch = currentResourceObjContent.match(/\/Font\s*(<<.*?>>)/);
         const fontResourcesString = fontMatch ? fontMatch[1] : '<< >>';
         
         this.objects[p.resId - 1] = `<< /Font ${fontResourcesString} /XObject << ${xobjectEntries.trim()} >> >>`;
+      }
+
+      // Add annotations to the page object if any
+      if (p.annotations && p.annotations.length > 0) {
+        const annotsRefs = p.annotations.map(id => `${id} 0 R`).join(' ');
+        let pageObjStr = this.objects[p.pid - 1];
+        // Insert /Annots before the final >> of the page dictionary.
+        // Regex matches optional whitespace then >> at the end of the string.
+        pageObjStr = pageObjStr.replace(/(\s*>>)$/, ` /Annots [${annotsRefs}] $1`);
+        this.objects[p.pid - 1] = pageObjStr;
       }
     }, this);
 
@@ -775,6 +1086,26 @@ class PDFExporter {
       pdf._processBlock(root, defaultStyle);
     });
     pdf.save(opts.filename);
+  }
+
+  _escapePDFString(text) {
+    if (typeof text !== 'string') return '';
+    return text.replace(/\\/g, '\\\\').replace(/\(/g, '\\(').replace(/\)/g, '\\)');
+  }
+
+  _addLinkAnnotation(rect, uri) {
+    if (!uri) return;
+    const annotObj = (
+      `<< /Type /Annot /Subtype /Link ` +
+      `/Rect [${rect[0].toFixed(3)} ${rect[1].toFixed(3)} ${rect[2].toFixed(3)} ${rect[3].toFixed(3)}] ` +
+      `/Border [0 0 0] ` +
+      `/A << /S /URI /URI (${this._escapePDFString(uri)}) >> >>`
+    );
+    const annotObjId = this._addObject(annotObj);
+    const currentPage = this.pages[this.pages.length - 1];
+    if (currentPage) {
+      currentPage.annotations.push(annotObjId);
+    }
   }
 }
 
