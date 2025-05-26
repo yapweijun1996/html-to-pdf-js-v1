@@ -1,0 +1,52 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>HTML to PDF Exporter</title>
+  <style>
+    body { font-family: sans-serif; padding: 20px; }
+    .toPDF { border: 1px solid #555; padding: 15px; margin-bottom: 20px; }
+    .toPDF h2 { margin: 0 0 8px; }
+    .toPDF p  { margin: 0 0 6px; }
+    .toPDF ul { margin: 0 0 10px 20px; }
+    .toPDF li { margin: 0 0 4px; }
+    .toPDF table { width: 100%; border-collapse: collapse; margin: 0 0 10px; }
+    .toPDF th, .toPDF td { border: 1px solid #333; padding: 5px; }
+    #downloadPdfBtn { padding: 10px 20px; font-size: 16px; cursor: pointer; }
+  </style>
+</head>
+<body>
+  <h1>Demo：HTML to PDF Exporter</h1>
+
+  <div class="toPDF">
+    <h2>Section 1</h2>
+    <p>This is <strong>section 1</strong> content.</p>
+    <ul>
+      <li>Item A</li>
+      <li>Item B</li>
+    </ul>
+  </div>
+
+  <div class="toPDF">
+    <h2>Section 2：Table Sample</h2>
+    <table>
+      <thead>
+        <tr><th>Col A</th><th>Col B</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>Value 1</td><td>Value 2</td></tr>
+        <tr><td>Value 3</td><td>Value 4</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <button id="downloadPdfBtn">Download PDF</button>
+
+  <script src="pdf-exporter.js"></script>
+  <script>
+    document.getElementById('downloadPdfBtn').addEventListener('click', function() {
+      PDFExporter.init({ selector: '.toPDF', filename: 'export.pdf' });
+    });
+  </script>
+</body>
+</html>
