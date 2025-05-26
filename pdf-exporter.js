@@ -391,12 +391,39 @@ class PDFExporter {
   // Nested lists with indent and ASCII bullet (now customizable)
   _drawList(listEl, level, styleState, isOrdered) {
     const items = Array.from(listEl.children).filter(el => el.tagName === 'LI');
-    items.forEach((li, idx) => {
-      this._ensureSpace(1); // Ensure space for at least one line for the bullet/item.
+    const cs = this._getStyle(listEl);
+    const listStyleType = cs.listStyleType || (isOrdered ? 'decimal' : 'disc');
 
-      const bulletText = isOrdered
-        ? this.olBulletFormat(idx, level)
-        : this.ulBulletSymbols[level % this.ulBulletSymbols.length];
+    items.forEach((li, idx) => {
+      this._ensureSpace(1);
+
+      let bulletText = '';
+      if (listStyleType !== 'none') {
+        if (isOrdered) {
+            // Use custom formatter if available and listStyleType is not one we directly handle as ordinal
+            const handledOrdinalTypes = ['decimal', 'lower-alpha', 'lower-latin', 'upper-alpha', 'upper-latin', 'lower-roman', 'upper-roman'];
+            if (typeof this.olBulletFormat === 'function' && !handledOrdinalTypes.includes(listStyleType)) {
+                bulletText = this.olBulletFormat(idx, level);
+            } else {
+                bulletText = this._getOrdinal(idx, listStyleType);
+            }
+        } else { // Unordered list
+            switch (listStyleType) {
+                case 'disc':
+                    bulletText = '\u2022 '; // •
+                    break;
+                case 'circle':
+                    bulletText = '\u25E6 '; // ◦
+                    break;
+                case 'square':
+                    bulletText = '\u25AA '; // ▪ (or use \u25A0 ■ for filled square)
+                    break;
+                default:
+                    bulletText = this.ulBulletSymbols[level % this.ulBulletSymbols.length] || '- ';
+                    break;
+            }
+        }
+      }
 
       const liBaseIndent = this.bulletIndent * level;
       const yPosBeforeItem = this.cursorY;
@@ -1106,6 +1133,53 @@ class PDFExporter {
     if (currentPage) {
       currentPage.annotations.push(annotObjId);
     }
+  }
+
+  _getOrdinal(index, listStyleType = 'decimal') {
+    const num = index + 1;
+    switch (listStyleType) {
+        case 'lower-alpha':
+        case 'lower-latin':
+            let alpha = '';
+            let tempNum = num;
+            while (tempNum > 0) {
+                tempNum--; // 1-indexed to 0-indexed for char code
+                alpha = String.fromCharCode(97 + (tempNum % 26)) + alpha;
+                tempNum = Math.floor(tempNum / 26);
+            }
+            return alpha + '. ';
+        case 'upper-alpha':
+        case 'upper-latin':
+            let upperAlpha = '';
+            let tempUpperNum = num;
+            while (tempUpperNum > 0) {
+                tempUpperNum--;
+                upperAlpha = String.fromCharCode(65 + (tempUpperNum % 26)) + upperAlpha;
+                tempUpperNum = Math.floor(tempUpperNum / 26);
+            }
+            return upperAlpha + '. ';
+        case 'lower-roman':
+            return this._toRoman(num).toLowerCase() + '. ';
+        case 'upper-roman':
+            return this._toRoman(num) + '. ';
+        case 'decimal':
+        default:
+            return num + '. ';
+    }
+  }
+
+  _toRoman(num) {
+    if (isNaN(num) || num < 1 || num > 3999) return String(num); // Fallback for out of typical Roman range
+    const roman = {
+        M: 1000, CM: 900, D: 500, CD: 400, C: 100, XC: 90, L: 50, XL: 40, X: 10, IX: 9, V: 5, IV: 4, I: 1
+    };
+    let str = '';
+    for (let i of Object.keys(roman)) {
+        let q = Math.floor(num / roman[i]);
+        num -= q * roman[i];
+        str += i.repeat(q);
+    }
+    return str;
   }
 }
 
