@@ -6,8 +6,8 @@
 class PDFExporter {
   constructor(opts = {}) {
     try {
-      // Validate constructor options
-      this._validateOptions(opts);
+      // Validate constructor options (returns validated copy)
+      opts = this._validateOptions(opts);
       
       this.objects = [];
       this.offsets = [];
@@ -152,8 +152,19 @@ class PDFExporter {
       throw new Error('Options object contains circular references');
     }
     
-    // Create a copy to avoid modifying the input object
-    const validatedOpts = { ...opts };
+    // Return validated options without modifying input (immutability)
+    const validatedOpts = {};
+    
+    // Copy primitive values safely
+    for (const [key, value] of Object.entries(opts || {})) {
+      if (typeof value !== 'object' || value === null) {
+        validatedOpts[key] = value;
+      } else if (Array.isArray(value)) {
+        validatedOpts[key] = [...value]; // Shallow copy arrays
+      } else {
+        validatedOpts[key] = { ...value }; // Shallow copy objects
+      }
+    }
     
     // Validate page dimensions with type conversion
     if (validatedOpts.pageWidth !== undefined) {
@@ -194,8 +205,8 @@ class PDFExporter {
       }
     });
     
-    // Copy validated options back to original object
-    Object.assign(opts, validatedOpts);
+    // Return validated options instead of modifying input
+    return validatedOpts;
   }
 
   _validateNumber(value, defaultValue, fieldName) {
@@ -1008,10 +1019,21 @@ class PDFExporter {
   // Recursively process inline <strong>,<em>,<span style> etc.
   _processInline(node, styleState, depth = 0) {
     // Prevent excessive recursion that could cause stack overflow
-    const maxDepth = 100;
+    const maxDepth = 50; // Reduced from 100 for safety
     if (depth > maxDepth) {
       this._addWarning(`Inline element nesting depth ${depth} exceeds maximum ${maxDepth}, skipping deeper elements`);
+      return; // Hard stop to prevent stack overflow
+    }
+    
+    // Additional safety check for circular references
+    if (node && node._pdfProcessing) {
+      this._addWarning('Circular reference detected in DOM, skipping element');
       return;
+    }
+    
+    // Mark node as being processed
+    if (node && node.nodeType === Node.ELEMENT_NODE) {
+      node._pdfProcessing = true;
     }
     if (node.nodeType === Node.TEXT_NODE) {
       const txt = this._normalizeWhiteSpace(node.textContent);
@@ -1099,15 +1121,21 @@ class PDFExporter {
       }
 
 
-      // Recursively process all child nodes with inherited styles
-      // except for <br> which is handled directly to force a line break.
-      if (tag === 'BR') {
-        this.cursorY -= newStyle.size * 1.2; // Advance cursor by one line height based on current style's size
-        this._ensureSpace(1); // Ensure we have space on a new page if needed
-        // No further processing for BR itself, it just moves the cursor.
-      } else {
-        Array.from(node.childNodes).forEach(child => this._processInline(child, newStyle, depth + 1));
+              // Recursively process all child nodes with inherited styles
+        // except for <br> which is handled directly to force a line break.
+        if (tag === 'BR') {
+          this.cursorY -= newStyle.size * 1.2; // Advance cursor by one line height based on current style's size
+          this._ensureSpace(1); // Ensure we have space on a new page if needed
+          // No further processing for BR itself, it just moves the cursor.
+        } else {
+          Array.from(node.childNodes).forEach(child => this._processInline(child, newStyle, depth + 1));
+        }
       }
+    }
+    
+    // Clean up processing marker
+    if (node && node.nodeType === Node.ELEMENT_NODE && node._pdfProcessing) {
+      delete node._pdfProcessing;
     }
   }
 
@@ -1878,18 +1906,22 @@ class PDFExporter {
       imageBitmap = await this._createImageBitmap(blob, src);
       if (!imageBitmap) return;
 
-      // Convert to standardized format
-      const imageData = await this._convertImageToStandardFormat(imageBitmap, type);
-      if (!imageData) return;
-
-      // Check total cache size limit
-      const estimatedSize = imageData.dataUrl.length * 2; // UTF-16 encoding
-      if (this.imageCacheSize + estimatedSize > this.maxImageCacheSize) {
+      // Check cache size before processing to prevent OOM
+      const estimatedImageSize = (imageBitmap.width || imageBitmap.naturalWidth || 100) * 
+                                 (imageBitmap.height || imageBitmap.naturalHeight || 100) * 4; // RGBA
+      if (this.imageCacheSize + estimatedImageSize > this.maxImageCacheSize) {
         this._addWarning(`Adding image would exceed cache limit, skipping: ${src}`);
         return;
       }
 
-      this.imageCacheSize += estimatedSize;
+      // Convert to standardized format
+      const imageData = await this._convertImageToStandardFormat(imageBitmap, type);
+      if (!imageData) return;
+
+      // Update cache size with actual size
+      const actualSize = imageData.dataUrl.length * 2; // UTF-16 encoding
+
+      this.imageCacheSize += actualSize;
       this.imageDataCache.set(img, imageData);
 
     } catch (error) {
@@ -1906,15 +1938,20 @@ class PDFExporter {
 
     src = src.trim();
 
-    // Allow data URLs and HTTP/HTTPS URLs only
+    // Allow data URLs and HTTPS URLs only (removed HTTP for security)
     if (src.startsWith('data:image/')) {
       return src;
     }
 
-    if (src.startsWith('http://') || src.startsWith('https://')) {
+    // Only allow HTTPS URLs for security
+    if (src.startsWith('https://')) {
       try {
         const url = new URL(src);
-        // Additional security checks could go here
+        // Additional security checks - validate hostname
+        if (url.hostname === 'localhost' || url.hostname.startsWith('127.') || url.hostname.startsWith('192.168.') || url.hostname.startsWith('10.')) {
+          this._addWarning(`Blocked private network URL: ${src}`);
+          return null;
+        }
         return url.href;
       } catch (error) {
         this._addWarning(`Invalid image URL: ${src}`);
@@ -1922,22 +1959,29 @@ class PDFExporter {
       }
     }
 
-    // Reject file:// and other potentially dangerous protocols
-    this._addWarning(`Unsupported image URL protocol: ${src}`);
+    // Reject all other protocols including HTTP and file://
+    this._addWarning(`Unsupported image URL protocol (only HTTPS and data: allowed): ${src}`);
     return null;
   }
 
   // Process data URL with validation
   _processDataUrl(src) {
     try {
-      const mimeTypeMatch = src.match(/^data:(image\/[a-z]+);base64,/);
+      // Enhanced validation for data URL format
+      const mimeTypeMatch = src.match(/^data:(image\/(?:jpeg|jpg|png|gif|webp|svg\+xml));base64,/i);
       if (!mimeTypeMatch) {
-        this._addWarning('Invalid data URL format');
+        this._addWarning('Invalid data URL format or unsupported image type');
         return null;
       }
 
-      const type = mimeTypeMatch[1];
+      const type = mimeTypeMatch[1].toLowerCase();
       const base64Data = src.substring(src.indexOf(',') + 1);
+      
+      // Validate base64 format before processing
+      if (!/^[A-Za-z0-9+/]*={0,2}$/.test(base64Data)) {
+        this._addWarning('Invalid base64 data in data URL');
+        return null;
+      }
       
       // Estimate size before processing
       const estimatedSize = (base64Data.length * 3) / 4; // Base64 to binary size
@@ -1946,15 +1990,19 @@ class PDFExporter {
         return null;
       }
 
-      // Convert to blob
-      const binaryString = atob(base64Data);
-      const bytes = new Uint8Array(binaryString.length);
-      for (let i = 0; i < binaryString.length; i++) {
-        bytes[i] = binaryString.charCodeAt(i);
+      // Safely convert to blob with error handling
+      try {
+        const binaryString = atob(base64Data);
+        const bytes = new Uint8Array(binaryString.length);
+        for (let i = 0; i < binaryString.length; i++) {
+          bytes[i] = binaryString.charCodeAt(i);
+        }
+        const blob = new Blob([bytes], { type });
+        return { blob, type };
+      } catch (decodeError) {
+        this._addWarning('Failed to decode base64 data');
+        return null;
       }
-      const blob = new Blob([bytes], { type });
-
-      return { blob, type };
     } catch (error) {
       this._addWarning('Failed to process data URL');
       return null;
@@ -1970,7 +2018,9 @@ class PDFExporter {
       const response = await fetch(src, {
         signal: controller.signal,
         mode: 'cors',
-        cache: 'default'
+        cache: 'default',
+        credentials: 'omit', // Prevent credential leakage
+        referrerPolicy: 'no-referrer' // Prevent referrer leakage
       });
 
       clearTimeout(timeoutId);
@@ -1980,10 +2030,18 @@ class PDFExporter {
         return null;
       }
 
-      // Validate content type
+      // Validate content type with stricter checking
       const contentType = response.headers.get('content-type');
-      if (!contentType || !contentType.startsWith('image/')) {
-        this._addWarning(`Invalid content type for image: ${src} (${contentType})`);
+      const allowedTypes = ['image/jpeg', 'image/jpg', 'image/png', 'image/gif', 'image/webp'];
+      if (!contentType || !allowedTypes.some(type => contentType.toLowerCase().startsWith(type))) {
+        this._addWarning(`Invalid or unsupported content type for image: ${src} (${contentType})`);
+        return null;
+      }
+
+      // Check content length before downloading
+      const contentLength = response.headers.get('content-length');
+      if (contentLength && parseInt(contentLength) > this.maxIndividualImageSize) {
+        this._addWarning(`Image too large: ${src} (${Math.round(parseInt(contentLength) / 1024 / 1024)}MB)`);
         return null;
       }
 
@@ -2225,15 +2283,25 @@ class PDFExporter {
     this.cursorY -= this.leading * 0.2;
   }
 
-  save(filename) {
+  async save(filename) {
     try {
       // Validate filename
       if (!filename || typeof filename !== 'string') {
         filename = 'document.pdf';
       }
       
-      // Sanitize filename
-      filename = filename.replace(/[^a-zA-Z0-9._-]/g, '_').substring(0, 255);
+      // Enhanced filename sanitization for security
+      filename = filename
+        .replace(/[<>:"/\\|?*\x00-\x1f]/g, '_') // Remove dangerous characters
+        .replace(/^\.+/, '') // Remove leading dots
+        .replace(/\.+$/, '') // Remove trailing dots
+        .substring(0, 200); // Leave room for .pdf extension
+      
+      // Ensure filename is not empty after sanitization
+      if (!filename || filename.trim() === '') {
+        filename = 'document';
+      }
+      
       if (!filename.endsWith('.pdf')) {
         filename += '.pdf';
       }
@@ -2328,32 +2396,46 @@ class PDFExporter {
       // Catalog object (/Type /Catalog)
       const catalog = this._addObject('<< /Type /Catalog /Pages ' + pagesObj + ' 0 R >>');
 
-      // Build PDF with memory management
-      const pdfParts = ['%PDF-1.4\n'];
+      // Build PDF with streaming approach for memory efficiency
+      const pdfParts = ['%PDF-1.7\n']; // Updated to PDF 1.7 for better compatibility
       let totalSize = pdfParts[0].length;
       
       // Check estimated size before building
-      const estimatedSize = this.objects.reduce((size, obj) => size + (obj ? obj.length : 0), 0) * 2;
-      if (estimatedSize > 100 * 1024 * 1024) { // 100MB limit
-        this._addWarning(`PDF size may be very large: ~${Math.round(estimatedSize / 1024 / 1024)}MB`);
+      const estimatedSize = this.objects.reduce((size, obj) => size + (obj ? obj.length : 0), 0);
+      if (estimatedSize > 50 * 1024 * 1024) { // Reduced limit to 50MB
+        throw new Error(`PDF size too large: ~${Math.round(estimatedSize / 1024 / 1024)}MB exceeds 50MB limit`);
       }
 
-      // Append each PDF object with size monitoring
-      this.objects.forEach((obj, i) => {
-        try {
-          this.offsets[i] = totalSize;
-          const objStr = (i+1) + ' 0 obj\n' + (obj || '') + 'endobj\n';
-          pdfParts.push(objStr);
-          totalSize += objStr.length;
-          
-          // Check for memory issues
-          if (totalSize > 200 * 1024 * 1024) { // 200MB hard limit
-            throw new Error('PDF size exceeds memory limit');
+      // Process objects in chunks to manage memory
+      const chunkSize = 100; // Process 100 objects at a time
+      for (let start = 0; start < this.objects.length; start += chunkSize) {
+        const end = Math.min(start + chunkSize, this.objects.length);
+        
+        for (let i = start; i < end; i++) {
+          try {
+            this.offsets[i] = totalSize;
+            const obj = this.objects[i];
+            if (obj) {
+              const objStr = (i+1) + ' 0 obj\n' + obj + '\nendobj\n';
+              pdfParts.push(objStr);
+              totalSize += objStr.length;
+              
+              // Check for memory issues more frequently
+              if (totalSize > 100 * 1024 * 1024) { // 100MB hard limit
+                throw new Error('PDF size exceeds memory limit during generation');
+              }
+            }
+          } catch (error) {
+            this._handleError(`Error processing object ${i}`, error);
+            throw error; // Re-throw to stop processing
           }
-        } catch (error) {
-          this._handleError(`Error processing object ${i}`, error);
         }
-      });
+        
+        // Allow garbage collection between chunks
+        if (start + chunkSize < this.objects.length) {
+          await new Promise(resolve => setTimeout(resolve, 0));
+        }
+      }
 
       // Cross-reference table (XRef)
       const xref = totalSize;
@@ -2446,7 +2528,7 @@ class PDFExporter {
       
       // Finalize and save
       pdf._reportProgress('finalization', 4, 4);
-      pdf.save(filename);
+      await pdf.save(filename);
       
       // Return summary
       const result = {
@@ -2466,12 +2548,33 @@ class PDFExporter {
     } catch (error) {
       console.error('PDFExporter initialization failed:', error);
       
-      // Cleanup on error
+      // Enhanced cleanup on error with resource tracking
       if (pdf) {
         try {
+          // Abort any ongoing operations first
+          if (pdf.abortController) {
+            pdf.abortController.abort();
+          }
+          
+          // Clean up DOM markers
+          if (typeof document !== 'undefined') {
+            document.querySelectorAll('[data-pdf-processing]').forEach(el => {
+              delete el._pdfProcessing;
+              el.removeAttribute('data-pdf-processing');
+            });
+          }
+          
+          // Force cleanup
           pdf.cleanup();
+          
+          // Clear references
+          pdf.objects = [];
+          pdf.pages = [];
+          pdf.streams = {};
+          
         } catch (cleanupError) {
           console.error('Cleanup failed:', cleanupError);
+          // Continue with error throwing even if cleanup fails
         }
       }
       
@@ -2529,64 +2632,46 @@ class PDFExporter {
         this._addWarning('PDF string truncated due to length limit');
       }
       
-      return text
-        // Escape backslashes first (must be done before other escapes)
-        .replace(/\\/g, '\\\\')
-        // Escape parentheses
-        .replace(/\(/g, '\\(')
-        .replace(/\)/g, '\\)')
-        // Escape other special PDF characters
-        .replace(/\r/g, '\\r')
-        .replace(/\n/g, '\\n')
-        .replace(/\t/g, '\\t')
-        .replace(/\b/g, '\\b')
-        .replace(/\f/g, '\\f')
-        // Escape non-printable ASCII characters
-        .replace(/[\x00-\x1F\x7F]/g, (match) => {
-          const code = match.charCodeAt(0);
-          return '\\' + code.toString(8).padStart(3, '0');
-        })
-        // Handle extended ASCII (128-255)
-        .replace(/[\x80-\xFF]/g, (match) => {
-          const code = match.charCodeAt(0);
-          return '\\' + code.toString(8).padStart(3, '0');
-        })
-        // Handle Unicode characters above 255 with proper UTF-8 encoding
-        .replace(/[\u0100-\uFFFF]/g, (match) => {
-          const code = match.charCodeAt(0);
-          
-          // Convert to UTF-8 bytes manually for better control
-          let utf8Bytes = [];
-          if (code < 0x800) {
-            // 2-byte sequence
-            utf8Bytes.push(0xC0 | (code >> 6));
-            utf8Bytes.push(0x80 | (code & 0x3F));
-          } else {
-            // 3-byte sequence
-            utf8Bytes.push(0xE0 | (code >> 12));
-            utf8Bytes.push(0x80 | ((code >> 6) & 0x3F));
-            utf8Bytes.push(0x80 | (code & 0x3F));
+      // Use more efficient single-pass escaping
+      let result = '';
+      for (let i = 0; i < text.length; i++) {
+        const char = text[i];
+        const code = char.charCodeAt(0);
+        
+        // Handle common cases first for performance
+        if (code >= 32 && code <= 126) {
+          // Printable ASCII
+          switch (char) {
+            case '\\': result += '\\\\'; break;
+            case '(': result += '\\('; break;
+            case ')': result += '\\)'; break;
+            default: result += char; break;
           }
-          
-          return utf8Bytes.map(byte => '\\' + byte.toString(8).padStart(3, '0')).join('');
-        })
-        // Handle high Unicode characters (above 0xFFFF) - surrogate pairs
-        .replace(/[\uD800-\uDBFF][\uDC00-\uDFFF]/g, (match) => {
-          // Convert surrogate pair to code point
-          const high = match.charCodeAt(0);
-          const low = match.charCodeAt(1);
-          const codePoint = 0x10000 + ((high & 0x3FF) << 10) + (low & 0x3FF);
-          
-          // Convert to UTF-8 (4-byte sequence)
-          const utf8Bytes = [
-            0xF0 | (codePoint >> 18),
-            0x80 | ((codePoint >> 12) & 0x3F),
-            0x80 | ((codePoint >> 6) & 0x3F),
-            0x80 | (codePoint & 0x3F)
-          ];
-          
-          return utf8Bytes.map(byte => '\\' + byte.toString(8).padStart(3, '0')).join('');
-        });
+        } else {
+          // Handle special characters
+          switch (char) {
+            case '\r': result += '\\r'; break;
+            case '\n': result += '\\n'; break;
+            case '\t': result += '\\t'; break;
+            case '\b': result += '\\b'; break;
+            case '\f': result += '\\f'; break;
+            default:
+              // Convert to octal escape for non-printable characters
+              if (code < 256) {
+                result += '\\' + code.toString(8).padStart(3, '0');
+              } else {
+                // For Unicode, use simpler approach - convert to UTF-8 bytes
+                const utf8 = new TextEncoder().encode(char);
+                for (const byte of utf8) {
+                  result += '\\' + byte.toString(8).padStart(3, '0');
+                }
+              }
+              break;
+          }
+        }
+      }
+      
+      return result;
     } catch (error) {
       this._handleError('PDF string escaping failed', error);
       // Enhanced fallback with basic security
@@ -2650,33 +2735,38 @@ class PDFExporter {
       uri = uri.substring(0, 2048);
     }
 
-    // Allow common safe protocols
-    const allowedProtocols = ['http:', 'https:', 'mailto:', 'tel:', 'ftp:'];
+    // Allow only safe protocols (removed http and ftp for security)
+    const allowedProtocols = ['https:', 'mailto:', 'tel:'];
     
     try {
       const url = new URL(uri);
       if (allowedProtocols.includes(url.protocol)) {
+        // Additional security checks for HTTPS URLs
+        if (url.protocol === 'https:') {
+          // Block private network URLs
+          if (url.hostname === 'localhost' || url.hostname.startsWith('127.') || 
+              url.hostname.startsWith('192.168.') || url.hostname.startsWith('10.')) {
+            this._addWarning(`Blocked private network URL: ${uri}`);
+            return null;
+          }
+        }
         return url.href;
       } else {
-        this._addWarning(`Unsupported link protocol: ${url.protocol}`);
+        this._addWarning(`Unsupported link protocol (only HTTPS, mailto, tel allowed): ${url.protocol}`);
         return null;
       }
     } catch (error) {
-      // Try relative URLs or fragments
+      // Only allow relative URLs and fragments - no auto-fixing
       if (uri.startsWith('#') || uri.startsWith('/') || uri.startsWith('./') || uri.startsWith('../')) {
+        // Validate relative URLs don't contain dangerous patterns
+        if (uri.includes('javascript:') || uri.includes('data:') || uri.includes('vbscript:')) {
+          this._addWarning(`Blocked potentially dangerous relative URL: ${uri}`);
+          return null;
+        }
         return uri;
       }
       
-      // Try adding https:// for domain-like strings
-      if (/^[a-zA-Z0-9][a-zA-Z0-9-]*[a-zA-Z0-9]*\.[a-zA-Z]{2,}/.test(uri)) {
-        try {
-          const httpsUrl = new URL('https://' + uri);
-          return httpsUrl.href;
-        } catch (e) {
-          // Fall through to rejection
-        }
-      }
-      
+      // Removed auto-fixing of URLs for security
       this._addWarning(`Invalid link URI format: ${uri}`);
       return null;
     }
