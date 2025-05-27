@@ -13,6 +13,8 @@ class PDFExporter {
       this.pages = [];
       this.streams = {};
       this.imageDataCache = new WeakMap(); // For storing preprocessed image data
+      this.imageCacheSize = 0; // Track image cache memory usage
+      this.maxImageCacheSize = this._validateNumber(opts.maxImageCacheSize, 50 * 1024 * 1024, 'maxImageCacheSize'); // 50MB default
       this.errors = []; // Track non-fatal errors
       this.warnings = []; // Track warnings
       
@@ -121,44 +123,50 @@ class PDFExporter {
       throw new Error('Options must be an object');
     }
     
+    // Create a copy to avoid modifying the input object
+    const validatedOpts = { ...opts };
+    
     // Validate page dimensions with type conversion
-    if (opts.pageWidth !== undefined) {
-      const converted = this._validateNumber(opts.pageWidth, null, 'pageWidth');
+    if (validatedOpts.pageWidth !== undefined) {
+      const converted = this._validateNumber(validatedOpts.pageWidth, null, 'pageWidth');
       if (converted === null || converted <= 0) {
         throw new Error('pageWidth must be a positive number');
       }
-      opts.pageWidth = converted;
+      validatedOpts.pageWidth = converted;
     }
-    if (opts.pageHeight !== undefined) {
-      const converted = this._validateNumber(opts.pageHeight, null, 'pageHeight');
+    if (validatedOpts.pageHeight !== undefined) {
+      const converted = this._validateNumber(validatedOpts.pageHeight, null, 'pageHeight');
       if (converted === null || converted <= 0) {
         throw new Error('pageHeight must be a positive number');
       }
-      opts.pageHeight = converted;
+      validatedOpts.pageHeight = converted;
     }
     
     // Validate margins with type conversion
-    if (opts.margin !== undefined) {
-      const converted = this._validateNumber(opts.margin, null, 'margin');
+    if (validatedOpts.margin !== undefined) {
+      const converted = this._validateNumber(validatedOpts.margin, null, 'margin');
       if (converted === null || converted < 0) {
         throw new Error('margin must be a non-negative number');
       }
-      opts.margin = converted;
+      validatedOpts.margin = converted;
     }
     
     // Validate font sizes
     const fontSizeFields = ['fontSize', 'h1FontSize', 'h2FontSize', 'h3FontSize', 'h4FontSize', 'h5FontSize', 'h6FontSize'];
     fontSizeFields.forEach(field => {
-      if (opts[field] !== undefined) {
-        const converted = this._validateNumber(opts[field], null, field);
+      if (validatedOpts[field] !== undefined) {
+        const converted = this._validateNumber(validatedOpts[field], null, field);
         if (converted === null || converted <= 0) {
           this._addWarning(`${field} must be a positive number, using default`);
-          delete opts[field]; // Let the constructor use defaults
+          delete validatedOpts[field]; // Let the constructor use defaults
         } else {
-          opts[field] = converted;
+          validatedOpts[field] = converted;
         }
       }
     });
+    
+    // Copy validated options back to original object
+    Object.assign(opts, validatedOpts);
   }
 
   _validateNumber(value, defaultValue, fieldName) {
@@ -166,11 +174,11 @@ class PDFExporter {
     
     // Attempt strict type conversion for strings that represent pure numbers
     if (typeof value === 'string') {
-      // Trim whitespace and check for pure numeric strings
+      // Trim whitespace and check for pure numeric strings (including scientific notation)
       const trimmed = value.trim();
       
-      // Reject strings with units or non-numeric characters (except decimal point and minus)
-      if (!/^-?\d*\.?\d+$/.test(trimmed)) {
+      // Enhanced regex to handle scientific notation and more number formats
+      if (!/^-?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?$/.test(trimmed)) {
         this._addWarning(`Invalid ${fieldName}: "${value}" contains non-numeric characters, using default: ${defaultValue}`);
         return defaultValue;
       }
@@ -384,14 +392,19 @@ class PDFExporter {
       
       // Different character widths based on type
       if (code >= 32 && code <= 126) { // ASCII printable
-        if ('iIl1'.includes(char)) width += size * 0.3; // Narrow chars
-        else if ('mMwW'.includes(char)) width += size * 0.8; // Wide chars
+        if ('iIl1|'.includes(char)) width += size * 0.3; // Narrow chars
+        else if ('mMwW@'.includes(char)) width += size * 0.8; // Wide chars
         else if ('fijrt'.includes(char)) width += size * 0.4; // Medium-narrow
+        else if ('ABCDEFGHIJKLMNOPQRSTUVWXYZ'.includes(char)) width += size * 0.7; // Uppercase
         else width += size * 0.6; // Average width
       } else if (code >= 0x4E00 && code <= 0x9FFF) { // CJK
         width += size * 1.0; // Full-width
       } else if (code >= 0x0600 && code <= 0x06FF) { // Arabic
         width += size * 0.5; // Variable width
+      } else if (code >= 0x0400 && code <= 0x04FF) { // Cyrillic
+        width += size * 0.65; // Similar to Latin
+      } else if (code >= 0x0370 && code <= 0x03FF) { // Greek
+        width += size * 0.65; // Similar to Latin
       } else {
         width += size * 0.6; // Default
       }
@@ -435,13 +448,18 @@ class PDFExporter {
       // Normalize the color string
       cssColor = cssColor.trim().toLowerCase();
       
-      // Named colors support
+      // Named colors support (expanded list)
       const namedColors = {
         'black': '#000000', 'white': '#ffffff', 'red': '#ff0000', 'green': '#008000',
         'blue': '#0000ff', 'yellow': '#ffff00', 'cyan': '#00ffff', 'magenta': '#ff00ff',
-        'silver': '#c0c0c0', 'gray': '#808080', 'maroon': '#800000', 'olive': '#808000',
-        'lime': '#00ff00', 'aqua': '#00ffff', 'teal': '#008080', 'navy': '#000080',
-        'fuchsia': '#ff00ff', 'purple': '#800080', 'orange': '#ffa500', 'pink': '#ffc0cb'
+        'silver': '#c0c0c0', 'gray': '#808080', 'grey': '#808080', 'maroon': '#800000', 
+        'olive': '#808000', 'lime': '#00ff00', 'aqua': '#00ffff', 'teal': '#008080', 
+        'navy': '#000080', 'fuchsia': '#ff00ff', 'purple': '#800080', 'orange': '#ffa500', 
+        'pink': '#ffc0cb', 'brown': '#a52a2a', 'darkred': '#8b0000', 'darkgreen': '#006400',
+        'darkblue': '#00008b', 'lightgray': '#d3d3d3', 'lightgrey': '#d3d3d3', 
+        'darkgray': '#a9a9a9', 'darkgrey': '#a9a9a9', 'lightblue': '#add8e6',
+        'lightgreen': '#90ee90', 'lightyellow': '#ffffe0', 'lightpink': '#ffb6c1',
+        'gold': '#ffd700', 'violet': '#ee82ee', 'indigo': '#4b0082', 'turquoise': '#40e0d0'
       };
       
       if (namedColors[cssColor]) {
@@ -723,6 +741,21 @@ class PDFExporter {
         cs = window.getComputedStyle(el);
         this.styleCache.set(el, cs);
         this.cacheSize++;
+        
+        // Track access order for LRU cache cleanup
+        if (!this.cacheAccessOrder) {
+          this.cacheAccessOrder = [];
+        }
+        this.cacheAccessOrder.push(el);
+      } else {
+        // Move to end of access order for LRU
+        if (this.cacheAccessOrder) {
+          const index = this.cacheAccessOrder.indexOf(el);
+          if (index > -1) {
+            this.cacheAccessOrder.splice(index, 1);
+            this.cacheAccessOrder.push(el);
+          }
+        }
       }
       return cs;
     } catch (error) {
@@ -746,10 +779,22 @@ class PDFExporter {
   }
 
   _cleanStyleCache() {
-    // Simple cache cleanup - in a real implementation, you might use LRU
-    this.styleCache = new WeakMap();
-    this.cacheSize = 0;
-    this._addWarning('Style cache cleaned due to size limit');
+    // Implement LRU-style cache cleanup by keeping track of access order
+    if (!this.cacheAccessOrder) {
+      this.cacheAccessOrder = [];
+    }
+    
+    // Remove oldest 50% of cached items
+    const itemsToRemove = Math.floor(this.cacheAccessOrder.length * 0.5);
+    for (let i = 0; i < itemsToRemove; i++) {
+      const element = this.cacheAccessOrder.shift();
+      if (element && this.styleCache.has(element)) {
+        this.styleCache.delete(element);
+        this.cacheSize--;
+      }
+    }
+    
+    this._addWarning(`Style cache cleaned: removed ${itemsToRemove} items, ${this.cacheSize} remaining`);
   }
 
   // Low-level draw a single text run at x,y
@@ -759,6 +804,17 @@ class PDFExporter {
     if (color) cmd += `${color.r.toFixed(3)} ${color.g.toFixed(3)} ${color.b.toFixed(3)} rg `;
     cmd += `${x} ${y} Td (${safe}) Tj ET\n`;
     this._write(cmd);
+  }
+
+  // Helper method to draw mark background (consolidates duplicate code)
+  _drawMarkBackground(xDraw, yBaseline, textWidth, fontSize, markBackgroundColor, originalColor) {
+    const xBg = xDraw - 1; // Small padding
+    const yBg = yBaseline - (fontSize * 0.75) - 1; // From approx ascent
+    const bgWidth = textWidth + 2; // Small padding
+    const bgHeight = fontSize + 2; // Full line height plus padding
+    this._write(`${markBackgroundColor.r.toFixed(3)} ${markBackgroundColor.g.toFixed(3)} ${markBackgroundColor.b.toFixed(3)} rg\n`);
+    this._write(`${xBg.toFixed(3)} ${yBg.toFixed(3)} ${bgWidth.toFixed(3)} ${bgHeight.toFixed(3)} re f\n`);
+    this._write(`${originalColor.r.toFixed(3)} ${originalColor.g.toFixed(3)} ${originalColor.b.toFixed(3)} rg\n`); // Reset to text color
   }
 
   // Styled inline text with wrapping and indent
@@ -771,9 +827,18 @@ class PDFExporter {
     let line = '';
     const originalColor = color; // Keep original color for non-link parts if a link has specific color
 
-    text.split(' ').forEach(word => {
-      const test = line + word + ' ';
-      if (this._textWidth(test.trim(), size) > effectiveMaxWidth && line) {
+    // Enhanced word splitting to handle various whitespace and break opportunities
+    const words = text.split(/(\s+)/).filter(part => part.length > 0);
+    
+    words.forEach(word => {
+      // Handle zero-width spaces and other break opportunities
+      if (/^\s+$/.test(word)) {
+        line += word;
+        return;
+      }
+      
+      const test = line + word;
+      if (this._textWidth(test.trim(), size) > effectiveMaxWidth && line.trim()) {
         const lineContent = line.trim();
         let yBaseline = this.cursorY;
         let xDraw = this.margin + indent;
@@ -792,15 +857,9 @@ class PDFExporter {
           yBaseline += currentFontSize * 0.35; // Raise baseline
         }
 
-        // Draw background for <mark>
+        // Draw background for <mark> - consolidated logic
         if (isMarked && markBackgroundColor && markBackgroundColor.a > 0) {
-            const xBg = xDraw - 1; // Small padding
-            const yBg = yBaseline - (currentFontSize * 0.75) - 1; // From approx ascent
-            const bgWidth = textWidthVal + 2; // Small padding
-            const bgHeight = currentFontSize + 2; // Full line height plus padding
-            this._write(`${markBackgroundColor.r.toFixed(3)} ${markBackgroundColor.g.toFixed(3)} ${markBackgroundColor.b.toFixed(3)} rg\n`);
-            this._write(`${xBg.toFixed(3)} ${yBg.toFixed(3)} ${bgWidth.toFixed(3)} ${bgHeight.toFixed(3)} re f\n`);
-            this._write(`${originalColor.r.toFixed(3)} ${originalColor.g.toFixed(3)} ${originalColor.b.toFixed(3)} rg\n`); // Reset to text color
+          this._drawMarkBackground(xDraw, yBaseline, textWidthVal, currentFontSize, markBackgroundColor, originalColor);
         }
 
         this._drawCell(lineContent, fontKey, currentFontSize, xDraw, yBaseline, originalColor);
@@ -819,8 +878,10 @@ class PDFExporter {
         }
 
         this.cursorY -= size * 1.2; // Original size for line height advancement
-        line = word + ' ';
-      } else line = test;
+        line = word;
+      } else {
+        line = test;
+      }
     });
     if (line) {
       const lineContent = line.trim();
@@ -841,15 +902,9 @@ class PDFExporter {
         yBaseline += currentFontSize * 0.35;
       }
 
-      // Draw background for <mark>
+      // Draw background for <mark> - consolidated logic
       if (isMarked && markBackgroundColor && markBackgroundColor.a > 0) {
-        const xBg = xDraw -1; // Small padding
-        const yBg = yBaseline - (currentFontSize * 0.75) -1; // From approx ascent
-        const bgWidth = textWidthVal + 2; // Small padding
-        const bgHeight = currentFontSize + 2; // Full line height plus padding
-        this._write(`${markBackgroundColor.r.toFixed(3)} ${markBackgroundColor.g.toFixed(3)} ${markBackgroundColor.b.toFixed(3)} rg\n`);
-        this._write(`${xBg.toFixed(3)} ${yBg.toFixed(3)} ${bgWidth.toFixed(3)} ${bgHeight.toFixed(3)} re f\n`);
-        this._write(`${originalColor.r.toFixed(3)} ${originalColor.g.toFixed(3)} ${originalColor.b.toFixed(3)} rg\n`); // Reset to text color for the text itself
+        this._drawMarkBackground(xDraw, yBaseline, textWidthVal, currentFontSize, markBackgroundColor, originalColor);
       }
 
       this._drawCell(lineContent, fontKey, currentFontSize, xDraw, yBaseline, originalColor);
@@ -1005,8 +1060,8 @@ class PDFExporter {
         if (listStyleType !== 'none') {
           if (isOrdered) {
               // Use custom formatter if available and listStyleType is not one we directly handle as ordinal
-              const handledOrdinalTypes = ['decimal', 'lower-alpha', 'lower-latin', 'upper-alpha', 'upper-latin', 'lower-roman', 'upper-roman'];
-              if (typeof this.olBulletFormat === 'function' && !handledOrdinalTypes.includes(listStyleType)) {
+              const handledOrdinalTypes = new Set(['decimal', 'lower-alpha', 'lower-latin', 'upper-alpha', 'upper-latin', 'lower-roman', 'upper-roman']);
+              if (typeof this.olBulletFormat === 'function' && !handledOrdinalTypes.has(listStyleType)) {
                   bulletText = this.olBulletFormat(idx, level);
               } else {
                   bulletText = this._getOrdinal(idx, listStyleType);
@@ -1035,7 +1090,9 @@ class PDFExporter {
         const liMarginLeft = PDFExporter._parseCssLength(liCs.marginLeft, styleState.size) || 0;
         
         // Calculate bullet position - position bullet at the start of the list's padding area
-        const bulletX = this.margin + (styleState.indent || 0) + levelIndent - 20; // 20px before content start
+        // Use font-size based offset instead of hardcoded 20px for better alignment
+        const bulletOffset = styleState.size * 1.5; // 1.5x font size for proper spacing
+        const bulletX = this.margin + (styleState.indent || 0) + levelIndent - bulletOffset;
 
         // Draw bullet text using _drawCell directly for precise control.
         if (bulletText) {
@@ -1084,10 +1141,10 @@ class PDFExporter {
         // Process nested lists that are direct children of this LI.
         Array.from(li.children).forEach(childLiElement => {
           if (['UL','OL'].includes(childLiElement.tagName)) {
-            // Nested lists start at 'level+1'. Their indent is relative to page margin.
+            // Nested lists start at 'level+1'. Pass itemContentStyle for proper inheritance
             // Additional safety check for deep nesting
             if (level + 1 <= 20) {
-              this._drawList(childLiElement, level + 1, styleState, childLiElement.tagName === 'OL');
+              this._drawList(childLiElement, level + 1, itemContentStyle, childLiElement.tagName === 'OL');
             } else {
               this._addWarning(`Skipping deeply nested list at level ${level + 1}`);
             }
@@ -1099,12 +1156,36 @@ class PDFExporter {
     }
   }
 
-  // Prepare table cell elements
+  // Prepare table cell elements with colspan/rowspan support
   _prepareTable(tableEl) {
-    const headers = Array.from(tableEl.querySelectorAll('thead tr')).map(tr => Array.from(tr.querySelectorAll('th')));
+    const headers = Array.from(tableEl.querySelectorAll('thead tr')).map(tr => 
+      Array.from(tr.querySelectorAll('th')).map(th => ({
+        element: th,
+        colspan: parseInt(th.getAttribute('colspan')) || 1,
+        rowspan: parseInt(th.getAttribute('rowspan')) || 1,
+        text: th.textContent.trim()
+      }))
+    );
+    
     const body = tableEl.querySelector('tbody') || tableEl;
-    const rows = Array.from(body.querySelectorAll('tr')).filter(tr => !tr.closest('thead')).map(tr => Array.from(tr.querySelectorAll('td')));
-    const colCount = headers[0]?.length || rows[0]?.length || 0;
+    const rows = Array.from(body.querySelectorAll('tr')).filter(tr => !tr.closest('thead')).map(tr => 
+      Array.from(tr.querySelectorAll('td')).map(td => ({
+        element: td,
+        colspan: parseInt(td.getAttribute('colspan')) || 1,
+        rowspan: parseInt(td.getAttribute('rowspan')) || 1,
+        text: td.textContent.trim()
+      }))
+    );
+    
+    // Calculate effective column count considering colspan
+    let maxCols = 0;
+    [...headers, ...rows].forEach(row => {
+      let colCount = 0;
+      row.forEach(cell => colCount += cell.colspan);
+      maxCols = Math.max(maxCols, colCount);
+    });
+    
+    const colCount = maxCols || 1;
     return { headers, rows, colCount, columnWidths: [] };
   }
 
@@ -1113,29 +1194,43 @@ class PDFExporter {
     try {
       const widths = Array(tableData.colCount).fill(0);
       
-      // Measure headers with precise padding
-      tableData.headers.forEach(row => row.forEach((cell, i) => {
-        const cs = this._getStyle(cell);
-        const paddingLeft = PDFExporter._parseCssLength(cs.paddingLeft, styleState.size) || 8;
-        const paddingRight = PDFExporter._parseCssLength(cs.paddingRight, styleState.size) || 8;
-        const totalPadding = paddingLeft + paddingRight;
-        
-        const textWidth = this._textWidth(cell.textContent.trim(), styleState.size);
-        const cellWidth = textWidth + totalPadding;
-        widths[i] = Math.max(widths[i], cellWidth);
-      }));
+      // Measure headers with precise padding and colspan support
+      tableData.headers.forEach(row => {
+        let colIndex = 0;
+        row.forEach(cell => {
+          const cs = this._getStyle(cell.element);
+          const paddingLeft = PDFExporter._parseCssLength(cs.paddingLeft, styleState.size) || 8;
+          const paddingRight = PDFExporter._parseCssLength(cs.paddingRight, styleState.size) || 8;
+          const totalPadding = paddingLeft + paddingRight;
+          
+          const textWidth = this._textWidth(cell.text, styleState.size);
+          const cellWidth = (textWidth + totalPadding) / cell.colspan; // Distribute across columns
+          
+          for (let i = 0; i < cell.colspan && colIndex + i < widths.length; i++) {
+            widths[colIndex + i] = Math.max(widths[colIndex + i], cellWidth);
+          }
+          colIndex += cell.colspan;
+        });
+      });
       
-      // Measure body cells with precise padding
-      tableData.rows.forEach(row => row.forEach((cell, i) => {
-        const cs = this._getStyle(cell);
-        const paddingLeft = PDFExporter._parseCssLength(cs.paddingLeft, styleState.size) || 8;
-        const paddingRight = PDFExporter._parseCssLength(cs.paddingRight, styleState.size) || 8;
-        const totalPadding = paddingLeft + paddingRight;
-        
-        const textWidth = this._textWidth(cell.textContent.trim(), styleState.size);
-        const cellWidth = textWidth + totalPadding;
-        widths[i] = Math.max(widths[i], cellWidth);
-      }));
+      // Measure body cells with precise padding and colspan support
+      tableData.rows.forEach(row => {
+        let colIndex = 0;
+        row.forEach(cell => {
+          const cs = this._getStyle(cell.element);
+          const paddingLeft = PDFExporter._parseCssLength(cs.paddingLeft, styleState.size) || 8;
+          const paddingRight = PDFExporter._parseCssLength(cs.paddingRight, styleState.size) || 8;
+          const totalPadding = paddingLeft + paddingRight;
+          
+          const textWidth = this._textWidth(cell.text, styleState.size);
+          const cellWidth = (textWidth + totalPadding) / cell.colspan; // Distribute across columns
+          
+          for (let i = 0; i < cell.colspan && colIndex + i < widths.length; i++) {
+            widths[colIndex + i] = Math.max(widths[colIndex + i], cellWidth);
+          }
+          colIndex += cell.colspan;
+        });
+      });
       
       tableData.columnWidths = widths;
     } catch (error) {
@@ -1591,10 +1686,27 @@ class PDFExporter {
             let type = 'image/jpeg'; // Default type
 
             if (src.startsWith('data:')) {
-              response = await fetch(src);
+              // Handle data URLs directly
               const MimeTypeMatch = src.match(/^data:(image\/[a-z]+);base64,/);
               if (MimeTypeMatch) type = MimeTypeMatch[1];
-              imageBitmap = await createImageBitmap(await response.blob());
+              
+              // Create blob from data URL for consistent processing
+              const response = await fetch(src);
+              const blob = await response.blob();
+              
+              // Use createImageBitmap with fallback for older browsers
+              if (typeof createImageBitmap === 'function') {
+                imageBitmap = await createImageBitmap(blob);
+              } else {
+                // Fallback for browsers without createImageBitmap
+                const img = new Image();
+                img.src = src;
+                await new Promise((resolve, reject) => {
+                  img.onload = resolve;
+                  img.onerror = reject;
+                });
+                imageBitmap = img;
+              }
             } else {
               response = await fetch(src);
               if (!response.ok) {
@@ -1602,8 +1714,22 @@ class PDFExporter {
                 return;
               }
               const blob = await response.blob();
-              type = blob.type;
-              imageBitmap = await createImageBitmap(blob);
+              type = blob.type || 'image/jpeg'; // Default type if not specified
+              
+              // Use createImageBitmap with fallback
+              if (typeof createImageBitmap === 'function') {
+                imageBitmap = await createImageBitmap(blob);
+              } else {
+                // Fallback for browsers without createImageBitmap
+                const img = new Image();
+                img.src = URL.createObjectURL(blob);
+                await new Promise((resolve, reject) => {
+                  img.onload = resolve;
+                  img.onerror = reject;
+                });
+                imageBitmap = img;
+                URL.revokeObjectURL(img.src); // Clean up
+              }
             }
 
             if (!imageBitmap) return;
@@ -1611,21 +1737,39 @@ class PDFExporter {
             // Use a canvas to convert to a data URL (PNG for transparency, JPEG otherwise)
             // This standardizes the format and makes embedding easier.
             const canvas = document.createElement('canvas');
-            canvas.width = imageBitmap.width;
-            canvas.height = imageBitmap.height;
+            canvas.width = imageBitmap.width || imageBitmap.naturalWidth || 100;
+            canvas.height = imageBitmap.height || imageBitmap.naturalHeight || 100;
             const ctx = canvas.getContext('2d');
-            ctx.drawImage(imageBitmap, 0, 0);
+            
+            // Handle both ImageBitmap and HTMLImageElement
+            if (imageBitmap.width !== undefined) {
+              ctx.drawImage(imageBitmap, 0, 0);
+            } else {
+              // For HTMLImageElement fallback
+              ctx.drawImage(imageBitmap, 0, 0, canvas.width, canvas.height);
+            }
             
             // Prefer PNG if original type suggests transparency, or if it's not JPEG. Otherwise, JPEG.
             const outputType = (type === 'image/png' || type === 'image/gif' || type === 'image/svg+xml') ? 'image/png' : 'image/jpeg';
             const dataUrl = canvas.toDataURL(outputType, outputType === 'image/jpeg' ? 0.85 : undefined);
 
-            this.imageDataCache.set(img, {
+            const imageData = {
               dataUrl,
               type: outputType, // Store the type of the dataUrl (image/jpeg or image/png)
-              width: imageBitmap.width,
-              height: imageBitmap.height
-            });
+              width: imageBitmap.width || imageBitmap.naturalWidth || 100,
+              height: imageBitmap.height || imageBitmap.naturalHeight || 100
+            };
+            
+            // Estimate memory usage (rough calculation)
+            const estimatedSize = dataUrl.length * 2; // UTF-16 encoding
+            this.imageCacheSize += estimatedSize;
+            
+            // Check cache size limit
+            if (this.imageCacheSize > this.maxImageCacheSize) {
+              this._addWarning(`Image cache size (${Math.round(this.imageCacheSize / 1024 / 1024)}MB) exceeds limit (${Math.round(this.maxImageCacheSize / 1024 / 1024)}MB)`);
+            }
+            
+            this.imageDataCache.set(img, imageData);
           } catch (error) {
             console.error('Error processing image:', src, error);
             this.imageDataCache.set(img, { error: true }); // Mark as errored
@@ -1848,8 +1992,8 @@ class PDFExporter {
     const catalog = this._addObject('<< /Type /Catalog /Pages ' + pagesObj + ' 0 R >>');
 
     // Build PDF
-    // Start with the PDF header, indicating the version.
-    let out = '%PDF-1.3\n';
+    // Start with the PDF header, indicating the version (updated to 1.4 for better compatibility).
+    let out = '%PDF-1.4\n';
     // Append each PDF object (streams, fonts, pages, catalog, etc.) sequentially.
     // Each object is numbered (e.g., "1 0 obj ... endobj").
     // We also record the byte offset of each object's start, for the XRef table.
@@ -1920,15 +2064,23 @@ class PDFExporter {
         textAlign: 'left'
       };
       
-      // Process each root element
+      // Process each root element with better error recovery
+      let processedCount = 0;
       rootElements.forEach((root, index) => {
         try {
           pdf._processBlock(root, defaultStyle);
+          processedCount++;
           pdf._reportProgress('processing', index + 1, rootElements.length);
         } catch (error) {
           pdf._handleError(`Processing element ${index} failed`, error);
+          // Continue processing other elements even if one fails
         }
       });
+      
+      // Check if any elements were successfully processed
+      if (processedCount === 0) {
+        throw new Error('No elements could be processed successfully');
+      }
       
       // Finalize and save
       pdf._reportProgress('finalization', 4, 4);
@@ -1966,10 +2118,25 @@ class PDFExporter {
         .replace(/\t/g, '\\t')
         .replace(/\b/g, '\\b')
         .replace(/\f/g, '\\f')
-        // Escape non-printable ASCII characters
-        .replace(/[\x00-\x1F\x7F]/g, (match) => {
+        // Escape non-printable ASCII characters and high Unicode
+        .replace(/[\x00-\x1F\x7F-\xFF]/g, (match) => {
           const code = match.charCodeAt(0);
           return '\\' + code.toString(8).padStart(3, '0');
+        })
+        // Handle Unicode characters above 255 by converting to UTF-8 bytes
+        .replace(/[\u0100-\uFFFF]/g, (match) => {
+          const code = match.charCodeAt(0);
+          if (code < 256) return match;
+          
+          // Convert to UTF-8 bytes and escape each byte
+          const utf8Bytes = encodeURIComponent(match)
+            .replace(/%/g, '')
+            .match(/.{2}/g) || [];
+          
+          return utf8Bytes.map(hex => {
+            const byte = parseInt(hex, 16);
+            return '\\' + byte.toString(8).padStart(3, '0');
+          }).join('');
         });
     } catch (error) {
       this._handleError('PDF string escaping failed', error);
@@ -2572,6 +2739,15 @@ class PDFExporter {
       throw new Error('Renderer must be a function');
     }
     
+    // Validate renderer function signature
+    if (renderer.length < 3) {
+      this._addWarning(`Renderer for ${tagName} should accept 3 parameters: (element, styleState, pdf)`);
+    }
+    
+    if (typeof tagName !== 'string' || !tagName.trim()) {
+      throw new Error('Tag name must be a non-empty string');
+    }
+    
     this.renderers[tagName.toUpperCase()] = renderer;
   }
 
@@ -2755,6 +2931,26 @@ class PDFExporter {
 
   // Add custom header/footer support
   setHeaderFooter(headerFn, footerFn) {
+    // Validate header function
+    if (headerFn !== null && headerFn !== undefined) {
+      if (typeof headerFn !== 'function') {
+        throw new Error('Header must be a function or null');
+      }
+      if (headerFn.length < 2) {
+        this._addWarning('Header function should accept 2 parameters: (pdf, pageInfo)');
+      }
+    }
+    
+    // Validate footer function
+    if (footerFn !== null && footerFn !== undefined) {
+      if (typeof footerFn !== 'function') {
+        throw new Error('Footer must be a function or null');
+      }
+      if (footerFn.length < 2) {
+        this._addWarning('Footer function should accept 2 parameters: (pdf, pageInfo)');
+      }
+    }
+    
     this.customHeader = typeof headerFn === 'function' ? headerFn : null;
     this.customFooter = typeof footerFn === 'function' ? footerFn : null;
   }
