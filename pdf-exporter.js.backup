@@ -1032,13 +1032,13 @@ class PDFExporter {
     }
     
     // Mark node as being processed
-    if (node && node.nodeType === Node.ELEMENT_NODE) {
+    if (node && node.nodeType === 1) { // Node.ELEMENT_NODE = 1
       node._pdfProcessing = true;
     }
-    if (node.nodeType === Node.TEXT_NODE) {
+    if (node.nodeType === 3) { // Node.TEXT_NODE = 3
       const txt = this._normalizeWhiteSpace(node.textContent);
       if (txt.length) this._drawStyledText(txt, styleState);
-    } else if (node.nodeType === Node.ELEMENT_NODE) {
+    } else if (node.nodeType === 1) { // Node.ELEMENT_NODE = 1
       const cs = this._getStyle(node);
       if (cs.display === 'none') {
         return; // Skip rendering this element and its children
@@ -1120,19 +1120,21 @@ class PDFExporter {
         newStyle.size = (newStyle.size || this.fontSizes.normal) * 0.85; // Reduce font size slightly
       }
 
-      // Recursively process all child nodes with inherited styles
-      // except for <br> which is handled directly to force a line break.
-      if (tag === 'BR') {
-        this.cursorY -= newStyle.size * 1.2; // Advance cursor by one line height based on current style's size
-        this._ensureSpace(1); // Ensure we have space on a new page if needed
-        // No further processing for BR itself, it just moves the cursor.
-      } else {
-        Array.from(node.childNodes).forEach(child => this._processInline(child, newStyle, depth + 1));
+
+              // Recursively process all child nodes with inherited styles
+        // except for <br> which is handled directly to force a line break.
+        if (tag === 'BR') {
+          this.cursorY -= newStyle.size * 1.2; // Advance cursor by one line height based on current style's size
+          this._ensureSpace(1); // Ensure we have space on a new page if needed
+          // No further processing for BR itself, it just moves the cursor.
+        } else {
+          Array.from(node.childNodes).forEach(child => this._processInline(child, newStyle, depth + 1));
+        }
       }
     }
     
     // Clean up processing marker
-    if (node && node.nodeType === Node.ELEMENT_NODE && node._pdfProcessing) {
+    if (node && node.nodeType === 1 && node._pdfProcessing) { // Node.ELEMENT_NODE = 1
       delete node._pdfProcessing;
     }
   }
@@ -1226,10 +1228,10 @@ class PDFExporter {
         Array.from(li.childNodes).forEach(childNode => {
           // Skip child nodes that are themselves lists (they are handled separately below)
           // and skip purely whitespace text nodes for the purpose of the contentWasProcessed flag.
-          if (childNode.nodeType === Node.ELEMENT_NODE && (childNode.tagName === 'UL' || childNode.tagName === 'OL')) {
+          if (childNode.nodeType === 1 && (childNode.tagName === 'UL' || childNode.tagName === 'OL')) { // Node.ELEMENT_NODE = 1
             return;
           }
-          if (childNode.nodeType === Node.TEXT_NODE && this._normalizeWhiteSpace(childNode.textContent).length === 0) {
+          if (childNode.nodeType === 3 && this._normalizeWhiteSpace(childNode.textContent).length === 0) { // Node.TEXT_NODE = 3
             return;
           }
           
