@@ -506,7 +506,7 @@ class PDFExporter {
 
   /**
    * Creates a fallback context object that mimics canvas measureText functionality
-   * Used when running in Node.js or when canvas is not available
+   * Used when canvas is not available in the browser
    * @returns {Object} Fallback context with measureText method
    */
   _createFallbackContext() {
@@ -2658,10 +2658,16 @@ class PDFExporter {
               if (code < 256) {
                 result += '\\' + code.toString(8).padStart(3, '0');
               } else {
-                // For Unicode, use simpler approach - convert to UTF-8 bytes
-                const utf8 = new TextEncoder().encode(char);
-                for (const byte of utf8) {
-                  result += '\\' + byte.toString(8).padStart(3, '0');
+                // For Unicode characters, use Unicode escape sequence
+                if (code <= 0xFFFF) {
+                  result += '\\u' + code.toString(16).padStart(4, '0');
+                } else {
+                  // For characters outside BMP, use surrogate pairs
+                  const surrogate = code - 0x10000;
+                  const high = 0xD800 + (surrogate >> 10);
+                  const low = 0xDC00 + (surrogate & 0x3FF);
+                  result += '\\u' + high.toString(16).padStart(4, '0');
+                  result += '\\u' + low.toString(16).padStart(4, '0');
                 }
               }
               break;
