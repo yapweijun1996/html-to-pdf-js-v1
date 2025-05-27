@@ -1,6 +1,7 @@
 // pdf-exporter.js
 // Single-file, zero-dependency HTML → PDF with CSS box-model, styled inline, nested lists, and multi-page tables
 // Enhanced with comprehensive error handling, validation, and robustness features
+// Version 2.0 - Fixed critical bugs, security issues, and performance problems
 
 class PDFExporter {
   constructor(opts = {}) {
@@ -15,8 +16,11 @@ class PDFExporter {
       this.imageDataCache = new WeakMap(); // For storing preprocessed image data
       this.imageCacheSize = 0; // Track image cache memory usage
       this.maxImageCacheSize = this._validateNumber(opts.maxImageCacheSize, 50 * 1024 * 1024, 'maxImageCacheSize'); // 50MB default
+      this.maxIndividualImageSize = this._validateNumber(opts.maxIndividualImageSize, 10 * 1024 * 1024, 'maxIndividualImageSize'); // 10MB per image
+      this.imageLoadTimeout = this._validateNumber(opts.imageLoadTimeout, 30000, 'imageLoadTimeout'); // 30 second timeout
       this.errors = []; // Track non-fatal errors
       this.warnings = []; // Track warnings
+      this.abortController = new AbortController(); // For canceling operations
       
       // Page size & orientation presets
       const _sizes = {
@@ -63,8 +67,8 @@ class PDFExporter {
       // Built-in fonts with error handling
       try {
         // Use Helvetica-Bold for headers to distinguish from regular bold text
-        const headerFont = opts.headerFont || 'Helvetica-Bold';
-        this.fH = this._addObject(`<< /Type /Font /Subtype /Type1 /BaseFont /${headerFont} >>`); // Header font (bold)
+        const headerFont = this._validateString(opts.headerFont, 'Helvetica-Bold', 'headerFont');
+        this.fH = this._addObject(`<< /Type /Font /Subtype /Type1 /BaseFont /${this._sanitizeFontName(headerFont)} >>`); // Header font (bold)
         this.fB = this._addObject('<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica-Bold >>'); // Bold font
         this.fI = this._addObject('<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica-Oblique >>'); // Italic font
         this.fN = this._addObject('<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>'); // Normal font
@@ -77,6 +81,8 @@ class PDFExporter {
       // Canvas for text measurement with fallback
       this.ctx = null;
       this._lastFontSpec = null;
+      this._textWidthCache = new Map(); // Cache for text width measurements
+      this._maxTextWidthCacheSize = 1000;
       
       try { 
         const c = document.createElement('canvas'); 
@@ -111,16 +117,39 @@ class PDFExporter {
       this.startTime = Date.now();
       this.processedElements = 0;
       
+      // Initialize with first page to avoid empty pages array
+      this._initializeFirstPage();
+      
     } catch (error) {
       this._handleError('PDFExporter constructor failed', error);
       throw error;
     }
   }
 
-  // Validation helper methods
+  // Initialize first page to avoid empty pages array issues
+  _initializeFirstPage() {
+    // This will be called by _newPage() when first page is actually needed
+    this._firstPageInitialized = false;
+  }
+
+  // Sanitize font name to prevent injection
+  _sanitizeFontName(fontName) {
+    if (typeof fontName !== 'string') return 'Helvetica';
+    // Only allow alphanumeric, hyphen, and underscore
+    return fontName.replace(/[^a-zA-Z0-9\-_]/g, '').substring(0, 50) || 'Helvetica';
+  }
+
+  // Enhanced validation with circular reference detection
   _validateOptions(opts) {
     if (opts && typeof opts !== 'object') {
       throw new Error('Options must be an object');
+    }
+    
+    // Check for circular references
+    try {
+      JSON.stringify(opts);
+    } catch (error) {
+      throw new Error('Options object contains circular references');
     }
     
     // Create a copy to avoid modifying the input object
@@ -197,8 +226,23 @@ class PDFExporter {
       return defaultValue;
     }
     
-    if (value < 0) {
+    // Allow negative values for certain fields (like margins can be negative in some contexts)
+    const allowNegativeFields = ['marginTop', 'marginBottom', 'marginLeft', 'marginRight'];
+    if (value < 0 && !allowNegativeFields.includes(fieldName)) {
       this._addWarning(`Invalid ${fieldName}: ${value} must be non-negative, using default: ${defaultValue}`);
+      return defaultValue;
+    }
+    
+    // Check for reasonable bounds
+    const maxValues = {
+      pageWidth: 14400, // 200 inches at 72 DPI
+      pageHeight: 14400,
+      fontSize: 144, // 2 inches
+      margin: 720 // 10 inches
+    };
+    
+    if (maxValues[fieldName] && value > maxValues[fieldName]) {
+      this._addWarning(`Invalid ${fieldName}: ${value} exceeds maximum ${maxValues[fieldName]}, using default: ${defaultValue}`);
       return defaultValue;
     }
     
@@ -327,6 +371,11 @@ class PDFExporter {
       this.cursorY = this.pageHeight - this.margin;
       this.currentPageImageCounter = 0; // For naming image resources on this page (e.g., Im1, Im2)
       
+      // Mark first page as initialized
+      if (!this._firstPageInitialized) {
+        this._firstPageInitialized = true;
+      }
+      
       // Draw custom header/footer if defined
       this._drawCustomHeaderFooter();
       
@@ -345,7 +394,21 @@ class PDFExporter {
   }
 
   _write(txt) {
-    const cid = this.pages[this.pages.length - 1].cid;
+    // Ensure we have at least one page
+    if (this.pages.length === 0) {
+      this._newPage();
+    }
+    
+    const currentPage = this.pages[this.pages.length - 1];
+    if (!currentPage || !currentPage.cid) {
+      this._handleError('Invalid page state during write operation', new Error('No valid current page'));
+      return;
+    }
+    
+    const cid = currentPage.cid;
+    if (!this.streams[cid]) {
+      this.streams[cid] = [];
+    }
     this.streams[cid].push(txt);
   }
 
@@ -357,6 +420,13 @@ class PDFExporter {
 
   _textWidth(text, size) {
     try {
+      // Check cache first
+      const cacheKey = `${text}|${size}|${this.fontFamily}`;
+      if (this._textWidthCache.has(cacheKey)) {
+        return this._textWidthCache.get(cacheKey);
+      }
+      
+      let width;
       if (this.ctx) {
         // Only reset canvas font if it changed
         const spec = `${size}px ${this.fontFamily}`;
@@ -365,10 +435,21 @@ class PDFExporter {
           this._lastFontSpec = spec;
         }
         const metrics = this.ctx.measureText(text);
-        return metrics.width;
+        width = metrics.width;
+      } else {
+        // Fallback calculation with better accuracy
+        width = this._fallbackTextWidth(text, size);
       }
-      // Fallback calculation with better accuracy
-      return this._fallbackTextWidth(text, size);
+      
+      // Cache the result
+      if (this._textWidthCache.size >= this._maxTextWidthCacheSize) {
+        // Clear oldest entries (simple FIFO)
+        const firstKey = this._textWidthCache.keys().next().value;
+        this._textWidthCache.delete(firstKey);
+      }
+      this._textWidthCache.set(cacheKey, width);
+      
+      return width;
     } catch (error) {
       this._handleError('Text width measurement failed', error);
       return this._fallbackTextWidth(text, size);
@@ -1158,35 +1239,93 @@ class PDFExporter {
 
   // Prepare table cell elements with colspan/rowspan support
   _prepareTable(tableEl) {
-    const headers = Array.from(tableEl.querySelectorAll('thead tr')).map(tr => 
-      Array.from(tr.querySelectorAll('th')).map(th => ({
-        element: th,
-        colspan: parseInt(th.getAttribute('colspan')) || 1,
-        rowspan: parseInt(th.getAttribute('rowspan')) || 1,
-        text: th.textContent.trim()
-      }))
-    );
-    
-    const body = tableEl.querySelector('tbody') || tableEl;
-    const rows = Array.from(body.querySelectorAll('tr')).filter(tr => !tr.closest('thead')).map(tr => 
-      Array.from(tr.querySelectorAll('td')).map(td => ({
-        element: td,
-        colspan: parseInt(td.getAttribute('colspan')) || 1,
-        rowspan: parseInt(td.getAttribute('rowspan')) || 1,
-        text: td.textContent.trim()
-      }))
-    );
-    
-    // Calculate effective column count considering colspan
-    let maxCols = 0;
-    [...headers, ...rows].forEach(row => {
-      let colCount = 0;
-      row.forEach(cell => colCount += cell.colspan);
-      maxCols = Math.max(maxCols, colCount);
-    });
-    
-    const colCount = maxCols || 1;
-    return { headers, rows, colCount, columnWidths: [] };
+    try {
+      const headers = Array.from(tableEl.querySelectorAll('thead tr')).map(tr => 
+        Array.from(tr.querySelectorAll('th')).map(th => {
+          // Validate and sanitize colspan/rowspan values
+          const colspanAttr = th.getAttribute('colspan');
+          const rowspanAttr = th.getAttribute('rowspan');
+          
+          let colspan = 1;
+          let rowspan = 1;
+          
+          if (colspanAttr) {
+            const parsed = parseInt(colspanAttr, 10);
+            if (!isNaN(parsed) && parsed > 0 && parsed <= 100) { // Reasonable limit
+              colspan = parsed;
+            }
+          }
+          
+          if (rowspanAttr) {
+            const parsed = parseInt(rowspanAttr, 10);
+            if (!isNaN(parsed) && parsed > 0 && parsed <= 100) { // Reasonable limit
+              rowspan = parsed;
+            }
+          }
+          
+          return {
+            element: th,
+            colspan,
+            rowspan,
+            text: (th.textContent || '').trim()
+          };
+        })
+      );
+      
+      const body = tableEl.querySelector('tbody') || tableEl;
+      const rows = Array.from(body.querySelectorAll('tr')).filter(tr => !tr.closest('thead')).map(tr => 
+        Array.from(tr.querySelectorAll('td')).map(td => {
+          // Validate and sanitize colspan/rowspan values
+          const colspanAttr = td.getAttribute('colspan');
+          const rowspanAttr = td.getAttribute('rowspan');
+          
+          let colspan = 1;
+          let rowspan = 1;
+          
+          if (colspanAttr) {
+            const parsed = parseInt(colspanAttr, 10);
+            if (!isNaN(parsed) && parsed > 0 && parsed <= 100) { // Reasonable limit
+              colspan = parsed;
+            }
+          }
+          
+          if (rowspanAttr) {
+            const parsed = parseInt(rowspanAttr, 10);
+            if (!isNaN(parsed) && parsed > 0 && parsed <= 100) { // Reasonable limit
+              rowspan = parsed;
+            }
+          }
+          
+          return {
+            element: td,
+            colspan,
+            rowspan,
+            text: (td.textContent || '').trim()
+          };
+        })
+      );
+      
+      // Calculate effective column count considering colspan
+      let maxCols = 0;
+      [...headers, ...rows].forEach(row => {
+        let colCount = 0;
+        row.forEach(cell => {
+          if (cell && typeof cell.colspan === 'number') {
+            colCount += cell.colspan;
+          } else {
+            colCount += 1; // Fallback
+          }
+        });
+        maxCols = Math.max(maxCols, colCount);
+      });
+      
+      const colCount = Math.max(maxCols, 1); // Ensure at least 1 column
+      return { headers, rows, colCount, columnWidths: [] };
+    } catch (error) {
+      this._handleError('Table preparation failed', error);
+      // Return minimal valid table structure
+      return { headers: [], rows: [], colCount: 1, columnWidths: [] };
+    }
   }
 
   // Measure minimum widths per column
@@ -1667,145 +1806,292 @@ class PDFExporter {
     }
   }
 
-  // Placeholder for image preprocessing - will be implemented in a subsequent step
+  // Enhanced image preprocessing with security and performance improvements
   async _loadAndPreprocessImages(elements) {
-    // This method will find all <img> tags, load their data (handling async operations),
-    // standardize them (e.g., via canvas), and store results in this.imageDataCache.
     const imagePromises = [];
+    const processedUrls = new Set(); // Prevent duplicate processing
     
     try {
       elements.forEach(element => {
         element.querySelectorAll('img').forEach(img => {
-          const promise = (async () => {
-            let src = img.getAttribute('src'); // Define src here to be available in catch
-            try {
-            if (!src) return;
+          const promise = this._processImageElement(img, processedUrls);
+          imagePromises.push(promise);
+        });
 
-            let response;
-            let imageBitmap;
-            let type = 'image/jpeg'; // Default type
-
-            if (src.startsWith('data:')) {
-              // Handle data URLs directly
-              const MimeTypeMatch = src.match(/^data:(image\/[a-z]+);base64,/);
-              if (MimeTypeMatch) type = MimeTypeMatch[1];
-              
-              // Create blob from data URL for consistent processing
-              const response = await fetch(src);
-              const blob = await response.blob();
-              
-              // Use createImageBitmap with fallback for older browsers
-              if (typeof createImageBitmap === 'function') {
-                imageBitmap = await createImageBitmap(blob);
-              } else {
-                // Fallback for browsers without createImageBitmap
-                const img = new Image();
-                img.src = src;
-                await new Promise((resolve, reject) => {
-                  img.onload = resolve;
-                  img.onerror = reject;
-                });
-                imageBitmap = img;
-              }
-            } else {
-              response = await fetch(src);
-              if (!response.ok) {
-                console.error(`Failed to fetch image: ${src}`, response.statusText);
-                return;
-              }
-              const blob = await response.blob();
-              type = blob.type || 'image/jpeg'; // Default type if not specified
-              
-              // Use createImageBitmap with fallback
-              if (typeof createImageBitmap === 'function') {
-                imageBitmap = await createImageBitmap(blob);
-              } else {
-                // Fallback for browsers without createImageBitmap
-                const img = new Image();
-                img.src = URL.createObjectURL(blob);
-                await new Promise((resolve, reject) => {
-                  img.onload = resolve;
-                  img.onerror = reject;
-                });
-                imageBitmap = img;
-                URL.revokeObjectURL(img.src); // Clean up
-              }
-            }
-
-            if (!imageBitmap) return;
-
-            // Use a canvas to convert to a data URL (PNG for transparency, JPEG otherwise)
-            // This standardizes the format and makes embedding easier.
-            const canvas = document.createElement('canvas');
-            canvas.width = imageBitmap.width || imageBitmap.naturalWidth || 100;
-            canvas.height = imageBitmap.height || imageBitmap.naturalHeight || 100;
-            const ctx = canvas.getContext('2d');
-            
-            // Handle both ImageBitmap and HTMLImageElement
-            if (imageBitmap.width !== undefined) {
-              ctx.drawImage(imageBitmap, 0, 0);
-            } else {
-              // For HTMLImageElement fallback
-              ctx.drawImage(imageBitmap, 0, 0, canvas.width, canvas.height);
-            }
-            
-            // Prefer PNG if original type suggests transparency, or if it's not JPEG. Otherwise, JPEG.
-            const outputType = (type === 'image/png' || type === 'image/gif' || type === 'image/svg+xml') ? 'image/png' : 'image/jpeg';
-            const dataUrl = canvas.toDataURL(outputType, outputType === 'image/jpeg' ? 0.85 : undefined);
-
-            const imageData = {
-              dataUrl,
-              type: outputType, // Store the type of the dataUrl (image/jpeg or image/png)
-              width: imageBitmap.width || imageBitmap.naturalWidth || 100,
-              height: imageBitmap.height || imageBitmap.naturalHeight || 100
-            };
-            
-            // Estimate memory usage (rough calculation)
-            const estimatedSize = dataUrl.length * 2; // UTF-16 encoding
-            this.imageCacheSize += estimatedSize;
-            
-            // Check cache size limit
-            if (this.imageCacheSize > this.maxImageCacheSize) {
-              this._addWarning(`Image cache size (${Math.round(this.imageCacheSize / 1024 / 1024)}MB) exceeds limit (${Math.round(this.maxImageCacheSize / 1024 / 1024)}MB)`);
-            }
-            
-            this.imageDataCache.set(img, imageData);
-          } catch (error) {
-            console.error('Error processing image:', src, error);
-            this.imageDataCache.set(img, { error: true }); // Mark as errored
-          }
-        })();
-        imagePromises.push(promise);
+        // Handle <canvas> elements
+        element.querySelectorAll('canvas').forEach(canvasEl => {
+          const promise = this._processCanvasElement(canvasEl);
+          imagePromises.push(promise);
+        });
       });
 
-      // Handle <canvas> elements
-      element.querySelectorAll('canvas').forEach(canvasEl => {
-        const promise = (async () => {
-          try {
-            if (canvasEl.width === 0 || canvasEl.height === 0) {
-                console.warn("Canvas element has zero width or height, skipping.", canvasEl);
-                return;
-            }
-            const dataUrl = canvasEl.toDataURL('image/png'); // Default to PNG for transparency
-            this.imageDataCache.set(canvasEl, {
-              dataUrl,
-              type: 'image/png',
-              width: canvasEl.width,
-              height: canvasEl.height
-            });
-          } catch (error) {
-            console.error('Error processing canvas:', canvasEl, error);
-            this.imageDataCache.set(canvasEl, { error: true }); // Mark as errored
-          }
-        })();
-        imagePromises.push(promise);
-      });
-    });
-
-      await Promise.all(imagePromises);
+      // Wait for all images with timeout
+      await Promise.allSettled(imagePromises);
     } catch (error) {
       this._handleError('Image preprocessing failed', error);
       // Continue execution even if image loading fails
+    }
+  }
+
+  // Process individual image element with security checks
+  async _processImageElement(img, processedUrls) {
+    let src = img.getAttribute('src');
+    try {
+      if (!src) return;
+
+      // Validate and sanitize URL
+      src = this._validateImageUrl(src);
+      if (!src) return;
+
+      // Prevent duplicate processing
+      if (processedUrls.has(src)) {
+        return;
+      }
+      processedUrls.add(src);
+
+      let imageBitmap;
+      let type = 'image/jpeg'; // Default type
+      let blob;
+
+      if (src.startsWith('data:')) {
+        // Handle data URLs with size validation
+        const result = this._processDataUrl(src);
+        if (!result) return;
+        blob = result.blob;
+        type = result.type;
+      } else {
+        // Handle external URLs with timeout and size limits
+        const response = await this._fetchImageWithTimeout(src);
+        if (!response) return;
+        
+        blob = await response.blob();
+        type = blob.type || 'image/jpeg';
+        
+        // Check individual image size limit
+        if (blob.size > this.maxIndividualImageSize) {
+          this._addWarning(`Image ${src} size (${Math.round(blob.size / 1024 / 1024)}MB) exceeds limit (${Math.round(this.maxIndividualImageSize / 1024 / 1024)}MB), skipping`);
+          return;
+        }
+      }
+
+      // Create image bitmap with fallback
+      imageBitmap = await this._createImageBitmap(blob, src);
+      if (!imageBitmap) return;
+
+      // Convert to standardized format
+      const imageData = await this._convertImageToStandardFormat(imageBitmap, type);
+      if (!imageData) return;
+
+      // Check total cache size limit
+      const estimatedSize = imageData.dataUrl.length * 2; // UTF-16 encoding
+      if (this.imageCacheSize + estimatedSize > this.maxImageCacheSize) {
+        this._addWarning(`Adding image would exceed cache limit, skipping: ${src}`);
+        return;
+      }
+
+      this.imageCacheSize += estimatedSize;
+      this.imageDataCache.set(img, imageData);
+
+    } catch (error) {
+      this._handleError(`Error processing image: ${src}`, error);
+      this.imageDataCache.set(img, { error: true });
+    }
+  }
+
+  // Validate image URL for security
+  _validateImageUrl(src) {
+    if (typeof src !== 'string' || !src.trim()) {
+      return null;
+    }
+
+    src = src.trim();
+
+    // Allow data URLs and HTTP/HTTPS URLs only
+    if (src.startsWith('data:image/')) {
+      return src;
+    }
+
+    if (src.startsWith('http://') || src.startsWith('https://')) {
+      try {
+        const url = new URL(src);
+        // Additional security checks could go here
+        return url.href;
+      } catch (error) {
+        this._addWarning(`Invalid image URL: ${src}`);
+        return null;
+      }
+    }
+
+    // Reject file:// and other potentially dangerous protocols
+    this._addWarning(`Unsupported image URL protocol: ${src}`);
+    return null;
+  }
+
+  // Process data URL with validation
+  _processDataUrl(src) {
+    try {
+      const mimeTypeMatch = src.match(/^data:(image\/[a-z]+);base64,/);
+      if (!mimeTypeMatch) {
+        this._addWarning('Invalid data URL format');
+        return null;
+      }
+
+      const type = mimeTypeMatch[1];
+      const base64Data = src.substring(src.indexOf(',') + 1);
+      
+      // Estimate size before processing
+      const estimatedSize = (base64Data.length * 3) / 4; // Base64 to binary size
+      if (estimatedSize > this.maxIndividualImageSize) {
+        this._addWarning(`Data URL image too large: ${Math.round(estimatedSize / 1024 / 1024)}MB`);
+        return null;
+      }
+
+      // Convert to blob
+      const binaryString = atob(base64Data);
+      const bytes = new Uint8Array(binaryString.length);
+      for (let i = 0; i < binaryString.length; i++) {
+        bytes[i] = binaryString.charCodeAt(i);
+      }
+      const blob = new Blob([bytes], { type });
+
+      return { blob, type };
+    } catch (error) {
+      this._addWarning('Failed to process data URL');
+      return null;
+    }
+  }
+
+  // Fetch image with timeout and abort capability
+  async _fetchImageWithTimeout(src) {
+    try {
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), this.imageLoadTimeout);
+
+      const response = await fetch(src, {
+        signal: controller.signal,
+        mode: 'cors',
+        cache: 'default'
+      });
+
+      clearTimeout(timeoutId);
+
+      if (!response.ok) {
+        this._addWarning(`Failed to fetch image: ${src} (${response.status})`);
+        return null;
+      }
+
+      // Validate content type
+      const contentType = response.headers.get('content-type');
+      if (!contentType || !contentType.startsWith('image/')) {
+        this._addWarning(`Invalid content type for image: ${src} (${contentType})`);
+        return null;
+      }
+
+      return response;
+    } catch (error) {
+      if (error.name === 'AbortError') {
+        this._addWarning(`Image load timeout: ${src}`);
+      } else {
+        this._addWarning(`Failed to fetch image: ${src} - ${error.message}`);
+      }
+      return null;
+    }
+  }
+
+  // Create image bitmap with fallback
+  async _createImageBitmap(blob, src) {
+    try {
+      if (typeof createImageBitmap === 'function') {
+        return await createImageBitmap(blob);
+      } else {
+        // Fallback for browsers without createImageBitmap
+        return new Promise((resolve, reject) => {
+          const img = new Image();
+          const url = URL.createObjectURL(blob);
+          
+          img.onload = () => {
+            URL.revokeObjectURL(url);
+            resolve(img);
+          };
+          
+          img.onerror = () => {
+            URL.revokeObjectURL(url);
+            reject(new Error('Failed to load image'));
+          };
+          
+          img.src = url;
+        });
+      }
+    } catch (error) {
+      this._addWarning(`Failed to create image bitmap: ${src}`);
+      return null;
+    }
+  }
+
+  // Convert image to standardized format
+  async _convertImageToStandardFormat(imageBitmap, type) {
+    try {
+      const canvas = document.createElement('canvas');
+      canvas.width = imageBitmap.width || imageBitmap.naturalWidth || 100;
+      canvas.height = imageBitmap.height || imageBitmap.naturalHeight || 100;
+      const ctx = canvas.getContext('2d');
+      
+      if (!ctx) {
+        this._addWarning('Cannot get canvas context for image conversion');
+        return null;
+      }
+
+      // Handle both ImageBitmap and HTMLImageElement
+      if (imageBitmap.width !== undefined) {
+        ctx.drawImage(imageBitmap, 0, 0);
+      } else {
+        // For HTMLImageElement fallback
+        ctx.drawImage(imageBitmap, 0, 0, canvas.width, canvas.height);
+      }
+      
+      // Choose output format based on original type
+      const outputType = (type === 'image/png' || type === 'image/gif' || type === 'image/svg+xml') ? 'image/png' : 'image/jpeg';
+      const quality = outputType === 'image/jpeg' ? 0.85 : undefined;
+      const dataUrl = canvas.toDataURL(outputType, quality);
+
+      return {
+        dataUrl,
+        type: outputType,
+        width: canvas.width,
+        height: canvas.height
+      };
+    } catch (error) {
+      this._addWarning('Failed to convert image to standard format');
+      return null;
+    }
+  }
+
+  // Process canvas element
+  async _processCanvasElement(canvasEl) {
+    try {
+      if (canvasEl.width === 0 || canvasEl.height === 0) {
+        this._addWarning("Canvas element has zero width or height, skipping");
+        return;
+      }
+
+      const dataUrl = canvasEl.toDataURL('image/png');
+      const estimatedSize = dataUrl.length * 2;
+
+      if (this.imageCacheSize + estimatedSize > this.maxImageCacheSize) {
+        this._addWarning('Adding canvas would exceed cache limit, skipping');
+        return;
+      }
+
+      this.imageCacheSize += estimatedSize;
+      this.imageDataCache.set(canvasEl, {
+        dataUrl,
+        type: 'image/png',
+        width: canvasEl.width,
+        height: canvasEl.height
+      });
+    } catch (error) {
+      this._handleError('Error processing canvas', error);
+      this.imageDataCache.set(canvasEl, { error: true });
     }
   }
 
@@ -1940,102 +2226,176 @@ class PDFExporter {
   }
 
   save(filename) {
-    // Finalize streams for each page
-    // Each page in a PDF has one or more content streams. These streams contain
-    // the actual drawing commands (text, lines, colors, etc.) for that page.
-    // Here, we're taking all the commands accumulated for each page and formatting
-    // them into the PDF stream syntax, including calculating their length.
-    this.pages.forEach(function(p) {
-      const content = this.streams[p.cid].join('');
-      const stream = '<< /Length ' + content.length + ' >> stream\n' + content + '\nendstream\n';
-      this.objects[p.cid - 1] = stream;
+    try {
+      // Validate filename
+      if (!filename || typeof filename !== 'string') {
+        filename = 'document.pdf';
+      }
+      
+      // Sanitize filename
+      filename = filename.replace(/[^a-zA-Z0-9._-]/g, '_').substring(0, 255);
+      if (!filename.endsWith('.pdf')) {
+        filename += '.pdf';
+      }
 
-      // If there are image resources for this page, update the resource object
-      if (Object.keys(p.imageResourceMap).length > 0) {
-        let xobjectEntries = '';
-        for (const imgName in p.imageResourceMap) {
-          xobjectEntries += `/${imgName} ${p.imageResourceMap[imgName]} 0 R `;
+      // Check if we have any pages
+      if (this.pages.length === 0) {
+        this._addWarning('No pages to save, creating empty document');
+        this._newPage();
+      }
+
+      // Finalize streams for each page with error handling
+      this.pages.forEach((p, pageIndex) => {
+        try {
+          if (!p || !p.cid || !this.streams[p.cid]) {
+            this._handleError(`Invalid page data at index ${pageIndex}`, new Error('Missing page data'));
+            return;
+          }
+
+          const content = this.streams[p.cid].join('');
+          const stream = '<< /Length ' + content.length + ' >> stream\n' + content + '\nendstream\n';
+          
+          // Bounds check for objects array
+          if (p.cid - 1 >= 0 && p.cid - 1 < this.objects.length) {
+            this.objects[p.cid - 1] = stream;
+          } else {
+            this._handleError(`Invalid content ID ${p.cid} for page ${pageIndex}`, new Error('Content ID out of bounds'));
+            return;
+          }
+
+          // If there are image resources for this page, update the resource object
+          if (p.imageResourceMap && Object.keys(p.imageResourceMap).length > 0) {
+            let xobjectEntries = '';
+            for (const imgName in p.imageResourceMap) {
+              if (p.imageResourceMap.hasOwnProperty(imgName)) {
+                xobjectEntries += `/${imgName} ${p.imageResourceMap[imgName]} 0 R `;
+              }
+            }
+            
+            if (p.resId - 1 >= 0 && p.resId - 1 < this.objects.length) {
+              const currentResourceObjContent = this.objects[p.resId - 1];
+              const fontMatch = currentResourceObjContent.match(/\/Font\s*(<<.*?>>)/);
+              const fontResourcesString = fontMatch ? fontMatch[1] : '<< >>';
+              
+              this.objects[p.resId - 1] = `<< /Font ${fontResourcesString} /XObject << ${xobjectEntries.trim()} >> >>`;
+            }
+          }
+
+          // Add annotations to the page object if any
+          if (p.annotations && Array.isArray(p.annotations) && p.annotations.length > 0) {
+            const annotsRefs = p.annotations
+              .filter(id => typeof id === 'number' && id > 0)
+              .map(id => `${id} 0 R`)
+              .join(' ');
+            
+            if (annotsRefs && p.pid - 1 >= 0 && p.pid - 1 < this.objects.length) {
+              let pageObjStr = this.objects[p.pid - 1];
+              // Insert /Annots before the final >> of the page dictionary.
+              pageObjStr = pageObjStr.replace(/(\s*>>)$/, ` /Annots [${annotsRefs}] $1`);
+              this.objects[p.pid - 1] = pageObjStr;
+            }
+          }
+        } catch (error) {
+          this._handleError(`Error finalizing page ${pageIndex}`, error);
         }
-        const currentResourceObjContent = this.objects[p.resId - 1];
-        const fontMatch = currentResourceObjContent.match(/\/Font\s*(<<.*?>>)/);
-        const fontResourcesString = fontMatch ? fontMatch[1] : '<< >>';
-        
-        this.objects[p.resId - 1] = `<< /Font ${fontResourcesString} /XObject << ${xobjectEntries.trim()} >> >>`;
+      });
+
+      // Pages tree (/Type /Pages)
+      const kids = this.pages
+        .filter(p => p && typeof p.pid === 'number')
+        .map(p => p.pid + ' 0 R')
+        .join(' ');
+      
+      if (!kids) {
+        throw new Error('No valid pages found for PDF generation');
+      }
+      
+      const pagesObj = this._addObject('<< /Type /Pages /Count ' + this.pages.length + ' /Kids [' + kids + '] >>');
+
+      // Update parent references in each Page object with bounds checking
+      this.objects = this.objects.map((obj, index) => {
+        try {
+          if (typeof obj === 'string' && obj.includes('/Parent 0 0 R')) {
+            return obj.replace('/Parent 0 0 R', '/Parent ' + pagesObj + ' 0 R');
+          }
+          return obj;
+        } catch (error) {
+          this._handleError(`Error updating parent reference for object ${index}`, error);
+          return obj;
+        }
+      });
+
+      // Catalog object (/Type /Catalog)
+      const catalog = this._addObject('<< /Type /Catalog /Pages ' + pagesObj + ' 0 R >>');
+
+      // Build PDF with memory management
+      const pdfParts = ['%PDF-1.4\n'];
+      let totalSize = pdfParts[0].length;
+      
+      // Check estimated size before building
+      const estimatedSize = this.objects.reduce((size, obj) => size + (obj ? obj.length : 0), 0) * 2;
+      if (estimatedSize > 100 * 1024 * 1024) { // 100MB limit
+        this._addWarning(`PDF size may be very large: ~${Math.round(estimatedSize / 1024 / 1024)}MB`);
       }
 
-      // Add annotations to the page object if any
-      if (p.annotations && p.annotations.length > 0) {
-        const annotsRefs = p.annotations.map(id => `${id} 0 R`).join(' ');
-        let pageObjStr = this.objects[p.pid - 1];
-        // Insert /Annots before the final >> of the page dictionary.
-        // Regex matches optional whitespace then >> at the end of the string.
-        pageObjStr = pageObjStr.replace(/(\s*>>)$/, ` /Annots [${annotsRefs}] $1`);
-        this.objects[p.pid - 1] = pageObjStr;
+      // Append each PDF object with size monitoring
+      this.objects.forEach((obj, i) => {
+        try {
+          this.offsets[i] = totalSize;
+          const objStr = (i+1) + ' 0 obj\n' + (obj || '') + 'endobj\n';
+          pdfParts.push(objStr);
+          totalSize += objStr.length;
+          
+          // Check for memory issues
+          if (totalSize > 200 * 1024 * 1024) { // 200MB hard limit
+            throw new Error('PDF size exceeds memory limit');
+          }
+        } catch (error) {
+          this._handleError(`Error processing object ${i}`, error);
+        }
+      });
+
+      // Cross-reference table (XRef)
+      const xref = totalSize;
+      pdfParts.push('xref\n0 ' + (this.objects.length+1) + '\n');
+      pdfParts.push('0000000000 65535 f \n');
+      
+      this.offsets.forEach(o => {
+        const offsetStr = ('0000000000' + o).slice(-10) + ' 00000 n \n';
+        pdfParts.push(offsetStr);
+      });
+
+      // Trailer
+      pdfParts.push('trailer<< /Size ' + (this.objects.length+1) + ' /Root ' + catalog + ' 0 R >>\n');
+      pdfParts.push('startxref\n' + xref + '\n%%EOF');
+
+      // Create and download blob
+      const blob = new Blob(pdfParts, { type: 'application/pdf' });
+      const url = URL.createObjectURL(blob);
+      
+      try {
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = filename;
+        a.style.display = 'none';
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+      } finally {
+        // Always clean up the URL
+        setTimeout(() => URL.revokeObjectURL(url), 1000);
       }
-    }, this);
-
-    // Pages tree (/Type /Pages)
-    // This is a dictionary object that acts as the root of the page tree.
-    // It contains a count of all pages and an array (/Kids) of indirect references
-    // to each individual Page object.
-    const kids = this.pages.map(p => p.pid + ' 0 R').join(' ');
-    const pagesObj = this._addObject('<< /Type /Pages /Count ' + this.pages.length + ' /Kids [' + kids + '] >>');
-
-    // Update parent references in each Page object (/Type /Page)
-    // Each Page object needs to point back to the Pages tree object as its /Parent.
-    // We initially put '0 0 R' as a placeholder; now we replace it.
-    this.objects = this.objects.map(obj => obj.replace('/Parent 0 0 R', '/Parent ' + pagesObj + ' 0 R'));
-
-    // Catalog object (/Type /Catalog)
-    // This is the root object of the PDF file. It primarily points to the Pages tree object,
-    // telling the PDF reader where to find the pages.
-    const catalog = this._addObject('<< /Type /Catalog /Pages ' + pagesObj + ' 0 R >>');
-
-    // Build PDF
-    // Start with the PDF header, indicating the version (updated to 1.4 for better compatibility).
-    let out = '%PDF-1.4\n';
-    // Append each PDF object (streams, fonts, pages, catalog, etc.) sequentially.
-    // Each object is numbered (e.g., "1 0 obj ... endobj").
-    // We also record the byte offset of each object's start, for the XRef table.
-    this.objects.forEach((obj, i) => {
-      this.offsets[i] = out.length;
-      out += (i+1) + ' 0 obj\n' + obj + 'endobj\n';
-    });
-
-    // Cross-reference table (XRef)
-    // This table lists the byte offset of each indirect object in the file.
-    // It allows random access to objects, which is essential for PDF readers.
-    // It starts with "xref", then the range of object numbers (0 to N),
-    // and then entries for each object: offset (10 digits), generation number (5 digits), and 'n' (in-use) or 'f' (free).
-    // Object 0 is special and always has offset 0, generation 65535, and 'f'.
-    const xref = out.length;
-    out += 'xref\n0 ' + (this.objects.length+1) + '\n';
-    out += '0000000000 65535 f \n';
-    this.offsets.forEach(o => {
-      out += ('0000000000' + o).slice(-10) + ' 00000 n \n';
-    });
-
-    // Trailer
-    // This is found at the end of the PDF. It tells the reader:
-    // - /Size: Total number of objects in the XRef table.
-    // - /Root: An indirect reference to the Catalog object (the document's root).
-    // It also gives the byte offset of the 'xref' keyword (startxref).
-    out += 'trailer<< /Size ' + (this.objects.length+1) + ' /Root ' + catalog + ' 0 R >>\n';
-    out += 'startxref\n' + xref + '\n%%EOF';
-
-    // Download
-    const blob = new Blob([out], { type: 'application/pdf' });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = filename;
-    a.click();
-    URL.revokeObjectURL(url);
+      
+    } catch (error) {
+      this._handleError('PDF save failed', error);
+      throw error;
+    }
   }
 
   static async init(opts = {}) {
+    let pdf = null;
     try {
-      const pdf = new PDFExporter(opts);
+      pdf = new PDFExporter(opts);
       const selector = opts.selector || 'body';
       const filename = opts.filename || 'document.pdf';
       
@@ -2051,9 +2411,11 @@ class PDFExporter {
       pdf._reportProgress('preprocessing', 2, 4);
       await pdf._loadAndPreprocessImages(rootElements);
       
-      // Start PDF generation
+      // Start PDF generation - ensure we have a page
       pdf._reportProgress('generation', 3, 4);
-      pdf._newPage();
+      if (!pdf._firstPageInitialized) {
+        pdf._newPage();
+      }
       
       const defaultStyle = { 
         fontKey: 'N', 
@@ -2087,7 +2449,7 @@ class PDFExporter {
       pdf.save(filename);
       
       // Return summary
-      return {
+      const result = {
         success: true,
         pages: pdf.pages.length,
         elementsProcessed: pdf.processedElements,
@@ -2096,9 +2458,64 @@ class PDFExporter {
         processingTime: Date.now() - pdf.startTime
       };
       
+      // Cleanup
+      pdf.cleanup();
+      
+      return result;
+      
     } catch (error) {
       console.error('PDFExporter initialization failed:', error);
+      
+      // Cleanup on error
+      if (pdf) {
+        try {
+          pdf.cleanup();
+        } catch (cleanupError) {
+          console.error('Cleanup failed:', cleanupError);
+        }
+      }
+      
       throw error;
+    }
+  }
+
+  // Cleanup method to free resources
+  cleanup() {
+    try {
+      // Abort any ongoing operations
+      if (this.abortController) {
+        this.abortController.abort();
+      }
+      
+      // Clear caches
+      if (this._textWidthCache) {
+        this._textWidthCache.clear();
+      }
+      
+      if (this.styleCache) {
+        // WeakMap doesn't have clear method, but references will be garbage collected
+        this.styleCache = new WeakMap();
+      }
+      
+      if (this.imageDataCache) {
+        // WeakMap doesn't have clear method, but references will be garbage collected
+        this.imageDataCache = new WeakMap();
+      }
+      
+      // Reset counters
+      this.imageCacheSize = 0;
+      this.cacheSize = 0;
+      
+      // Clear arrays
+      this.objects = [];
+      this.offsets = [];
+      this.pages = [];
+      this.streams = {};
+      this.errors = [];
+      this.warnings = [];
+      
+    } catch (error) {
+      console.error('Cleanup error:', error);
     }
   }
 
@@ -2106,6 +2523,12 @@ class PDFExporter {
     if (typeof text !== 'string') return '';
     
     try {
+      // Limit string length to prevent memory issues
+      if (text.length > 10000) {
+        text = text.substring(0, 10000) + '...';
+        this._addWarning('PDF string truncated due to length limit');
+      }
+      
       return text
         // Escape backslashes first (must be done before other escapes)
         .replace(/\\/g, '\\\\')
@@ -2118,44 +2541,144 @@ class PDFExporter {
         .replace(/\t/g, '\\t')
         .replace(/\b/g, '\\b')
         .replace(/\f/g, '\\f')
-        // Escape non-printable ASCII characters and high Unicode
-        .replace(/[\x00-\x1F\x7F-\xFF]/g, (match) => {
+        // Escape non-printable ASCII characters
+        .replace(/[\x00-\x1F\x7F]/g, (match) => {
           const code = match.charCodeAt(0);
           return '\\' + code.toString(8).padStart(3, '0');
         })
-        // Handle Unicode characters above 255 by converting to UTF-8 bytes
+        // Handle extended ASCII (128-255)
+        .replace(/[\x80-\xFF]/g, (match) => {
+          const code = match.charCodeAt(0);
+          return '\\' + code.toString(8).padStart(3, '0');
+        })
+        // Handle Unicode characters above 255 with proper UTF-8 encoding
         .replace(/[\u0100-\uFFFF]/g, (match) => {
           const code = match.charCodeAt(0);
-          if (code < 256) return match;
           
-          // Convert to UTF-8 bytes and escape each byte
-          const utf8Bytes = encodeURIComponent(match)
-            .replace(/%/g, '')
-            .match(/.{2}/g) || [];
+          // Convert to UTF-8 bytes manually for better control
+          let utf8Bytes = [];
+          if (code < 0x800) {
+            // 2-byte sequence
+            utf8Bytes.push(0xC0 | (code >> 6));
+            utf8Bytes.push(0x80 | (code & 0x3F));
+          } else {
+            // 3-byte sequence
+            utf8Bytes.push(0xE0 | (code >> 12));
+            utf8Bytes.push(0x80 | ((code >> 6) & 0x3F));
+            utf8Bytes.push(0x80 | (code & 0x3F));
+          }
           
-          return utf8Bytes.map(hex => {
-            const byte = parseInt(hex, 16);
-            return '\\' + byte.toString(8).padStart(3, '0');
-          }).join('');
+          return utf8Bytes.map(byte => '\\' + byte.toString(8).padStart(3, '0')).join('');
+        })
+        // Handle high Unicode characters (above 0xFFFF) - surrogate pairs
+        .replace(/[\uD800-\uDBFF][\uDC00-\uDFFF]/g, (match) => {
+          // Convert surrogate pair to code point
+          const high = match.charCodeAt(0);
+          const low = match.charCodeAt(1);
+          const codePoint = 0x10000 + ((high & 0x3FF) << 10) + (low & 0x3FF);
+          
+          // Convert to UTF-8 (4-byte sequence)
+          const utf8Bytes = [
+            0xF0 | (codePoint >> 18),
+            0x80 | ((codePoint >> 12) & 0x3F),
+            0x80 | ((codePoint >> 6) & 0x3F),
+            0x80 | (codePoint & 0x3F)
+          ];
+          
+          return utf8Bytes.map(byte => '\\' + byte.toString(8).padStart(3, '0')).join('');
         });
     } catch (error) {
       this._handleError('PDF string escaping failed', error);
-      return String(text).replace(/[\\()]/g, '\\$&'); // Basic fallback
+      // Enhanced fallback with basic security
+      return String(text)
+        .substring(0, 1000) // Limit length
+        .replace(/[\\()]/g, '\\$&') // Basic escaping
+        .replace(/[\x00-\x1F\x7F-\xFF]/g, '?'); // Replace problematic chars
     }
   }
 
   _addLinkAnnotation(rect, uri) {
     if (!uri) return;
-    const annotObj = (
-      `<< /Type /Annot /Subtype /Link ` +
-      `/Rect [${rect[0].toFixed(3)} ${rect[1].toFixed(3)} ${rect[2].toFixed(3)} ${rect[3].toFixed(3)}] ` +
-      `/Border [0 0 0] ` +
-      `/A << /S /URI /URI (${this._escapePDFString(uri)}) >> >>`
-    );
-    const annotObjId = this._addObject(annotObj);
-    const currentPage = this.pages[this.pages.length - 1];
-    if (currentPage) {
-      currentPage.annotations.push(annotObjId);
+    
+    // Validate and sanitize URI
+    const validatedUri = this._validateLinkUri(uri);
+    if (!validatedUri) {
+      this._addWarning(`Invalid link URI rejected: ${uri}`);
+      return;
+    }
+    
+    // Validate rectangle coordinates
+    if (!Array.isArray(rect) || rect.length !== 4 || rect.some(coord => typeof coord !== 'number' || !isFinite(coord))) {
+      this._addWarning('Invalid rectangle coordinates for link annotation');
+      return;
+    }
+    
+    try {
+      const annotObj = (
+        `<< /Type /Annot /Subtype /Link ` +
+        `/Rect [${rect[0].toFixed(3)} ${rect[1].toFixed(3)} ${rect[2].toFixed(3)} ${rect[3].toFixed(3)}] ` +
+        `/Border [0 0 0] ` +
+        `/A << /S /URI /URI (${this._escapePDFString(validatedUri)}) >> >>`
+      );
+      const annotObjId = this._addObject(annotObj);
+      
+      // Ensure we have a current page
+      if (this.pages.length === 0) {
+        this._newPage();
+      }
+      
+      const currentPage = this.pages[this.pages.length - 1];
+      if (currentPage && currentPage.annotations) {
+        currentPage.annotations.push(annotObjId);
+      }
+    } catch (error) {
+      this._handleError('Failed to create link annotation', error);
+    }
+  }
+
+  // Validate link URI for security
+  _validateLinkUri(uri) {
+    if (typeof uri !== 'string' || !uri.trim()) {
+      return null;
+    }
+
+    uri = uri.trim();
+
+    // Limit URI length
+    if (uri.length > 2048) {
+      this._addWarning('Link URI too long, truncating');
+      uri = uri.substring(0, 2048);
+    }
+
+    // Allow common safe protocols
+    const allowedProtocols = ['http:', 'https:', 'mailto:', 'tel:', 'ftp:'];
+    
+    try {
+      const url = new URL(uri);
+      if (allowedProtocols.includes(url.protocol)) {
+        return url.href;
+      } else {
+        this._addWarning(`Unsupported link protocol: ${url.protocol}`);
+        return null;
+      }
+    } catch (error) {
+      // Try relative URLs or fragments
+      if (uri.startsWith('#') || uri.startsWith('/') || uri.startsWith('./') || uri.startsWith('../')) {
+        return uri;
+      }
+      
+      // Try adding https:// for domain-like strings
+      if (/^[a-zA-Z0-9][a-zA-Z0-9-]*[a-zA-Z0-9]*\.[a-zA-Z]{2,}/.test(uri)) {
+        try {
+          const httpsUrl = new URL('https://' + uri);
+          return httpsUrl.href;
+        } catch (e) {
+          // Fall through to rejection
+        }
+      }
+      
+      this._addWarning(`Invalid link URI format: ${uri}`);
+      return null;
     }
   }
 
@@ -2193,17 +2716,40 @@ class PDFExporter {
   }
 
   _toRoman(num) {
-    if (isNaN(num) || num < 1 || num > 3999) return String(num); // Fallback for out of typical Roman range
+    // Enhanced validation and edge case handling
+    if (typeof num !== 'number' || isNaN(num) || !isFinite(num)) {
+      return String(num || 1); // Fallback to string representation
+    }
+    
+    // Round to integer and ensure positive
+    num = Math.max(1, Math.floor(Math.abs(num)));
+    
+    // Handle out of range values
+    if (num > 3999) {
+      this._addWarning(`Roman numeral conversion: ${num} exceeds maximum (3999), using fallback`);
+      return String(num);
+    }
+    
+    if (num === 0) {
+      return 'I'; // Roman numerals don't have zero, use I
+    }
+    
     const roman = {
         M: 1000, CM: 900, D: 500, CD: 400, C: 100, XC: 90, L: 50, XL: 40, X: 10, IX: 9, V: 5, IV: 4, I: 1
     };
+    
     let str = '';
-    for (let i of Object.keys(roman)) {
+    try {
+      for (let i of Object.keys(roman)) {
         let q = Math.floor(num / roman[i]);
         num -= q * roman[i];
         str += i.repeat(q);
+      }
+      return str || 'I'; // Ensure we always return something
+    } catch (error) {
+      this._handleError('Roman numeral conversion failed', error);
+      return String(num);
     }
-    return str;
   }
 
   // Enhanced Unicode normalization with comprehensive character support

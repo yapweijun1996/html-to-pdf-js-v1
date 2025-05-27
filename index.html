@@ -44,8 +44,48 @@
 
   <script src="pdf-exporter.js"></script>
   <script>
-    document.getElementById('downloadPdfBtn').addEventListener('click', function() {
-      PDFExporter.init({ selector: '.toPDF', filename: 'export.pdf' });
+    document.getElementById('downloadPdfBtn').addEventListener('click', async function() {
+      const button = this;
+      const originalText = button.textContent;
+      
+      try {
+        // Disable button and show loading state
+        button.disabled = true;
+        button.textContent = 'Generating PDF...';
+        
+        // Generate PDF with error handling and progress tracking
+        const result = await PDFExporter.init({ 
+          selector: '.toPDF', 
+          filename: 'export.pdf',
+          debug: true,
+          onProgress: (info) => {
+            button.textContent = `${info.phase}: ${info.percentage}%`;
+          },
+          onError: (error) => {
+            console.error('PDF Generation Error:', error);
+          },
+          onWarning: (warning) => {
+            console.warn('PDF Generation Warning:', warning);
+          }
+        });
+        
+        console.log('PDF generated successfully:', result);
+        button.textContent = 'PDF Downloaded!';
+        
+        // Reset button after delay
+        setTimeout(() => {
+          button.textContent = originalText;
+          button.disabled = false;
+        }, 2000);
+        
+      } catch (error) {
+        console.error('Failed to generate PDF:', error);
+        alert('Failed to generate PDF. Please check the console for details.');
+        
+        // Reset button
+        button.textContent = originalText;
+        button.disabled = false;
+      }
     });
   </script>
 </body>
