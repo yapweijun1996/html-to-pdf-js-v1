@@ -1,0 +1,16 @@
+{
+  "name": "gecko-pdf",
+  "version": "0.1.0",
+  "description": "Browser-grade HTML to PDF rendering engine",
+  "main": "dist/gecko-pdf.js",
+  "scripts": {
+    "build": "echo 'No build step yet'",
+    "test": "echo 'No tests yet'"
+  },
+  "keywords": ["pdf", "html", "browser", "printing"],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "jspdf": "^2.5.1"
+  }
+}

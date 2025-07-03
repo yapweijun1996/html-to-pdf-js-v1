@@ -1,0 +1,22 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <title>GeckoPDF Demo</title>
+  <script type="module">
+    import { htmlToPdf } from '../src/main.js';
+    window.onload = () => {
+      document.getElementById('export').onclick = () => {
+        htmlToPdf(document.getElementById('content'), { filename: 'demo.pdf' });
+      };
+    };
+  </script>
+</head>
+<body>
+  <div id="content">
+    <h1>GeckoPDF Demo</h1>
+    <p>This is a simple demo.</p>
+  </div>
+  <button id="export">Export PDF</button>
+</body>
+</html>
